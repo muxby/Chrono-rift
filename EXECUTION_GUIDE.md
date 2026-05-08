@@ -10,12 +10,12 @@
 |-----------|---------------|----------|
 | **Process Management** | fork/exec for 3 processes; PIDs tracked in shared memory | `standalone_main.cpp`, `shared.hpp` |
 | **Shared Memory IPC** | shm_open + mmap; `/dev/shm/chrono_rift_shm` | `common.hpp:map_shared()` |
-| **Threading** | 3 threads per arbiter (render, deadlock_monitor, turn_scheduler) | `arbiter.cpp` |
-| **Synchronization** | pthread_mutex + pthread_cond (PTHREAD_PROCESS_SHARED) | `arbiter.cpp:init_state()` |
-| **Signal-based Stun** | SIGUSR1 async delivery; SIGALRM for Ultimate pause | `arbiter.cpp`, `hip.cpp`, `asp.cpp` |
-| **Deadlock Detection** | Circular-wait detection on Solar Core + Lunar Blade | `arbiter.cpp:deadlock_monitor()` |
-| **CPU Scheduling** | Stamina-based priority scheduling via dedicated thread | `arbiter.cpp:schedule_next_turn()` |
-| **Real-time Visualization** | NCurses TUI (Combat + Scheduler views) + SFML Visualizer | `arbiter.cpp:render_thread()` |
+| **Threading** | 3 threads per arbiter (render, deadlock_monitor, turn_scheduler) | `sfml_arbiter.cpp` |
+| **Synchronization** | pthread_mutex + pthread_cond (PTHREAD_PROCESS_SHARED) | `sfml_arbiter.cpp:init_state()` |
+| **Signal-based Stun** | SIGUSR1 async delivery; SIGALRM for Ultimate pause | `sfml_arbiter.cpp`, `hip.cpp`, `asp.cpp` |
+| **Deadlock Detection** | Circular-wait detection on Solar Core + Lunar Blade | `sfml_arbiter.cpp:deadlock_monitor()` |
+| **CPU Scheduling** | Stamina-based priority scheduling via dedicated thread | `sfml_arbiter.cpp:schedule_next_turn()` |
+| **Real-time Visualization** | SFML Visualizer (Combat + Scheduler + Hybrid views) | `Visualizer.cpp` |
 
 ---
 
@@ -25,14 +25,13 @@
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y libsfml-dev g++ make libncurses5-dev libncursesw5-dev
+sudo apt-get install -y libsfml-dev g++ make
 ```
 
 ### Build Targets
 
 ```bash
-make all              # Build everything (ncurses + SFML)
-make legacy           # Terminal modules only (arbiter + hip + asp)
+make all              # Build everything
 make sfml_arbiter     # SFML arbiter with Visualizer UI
 make sfml             # Passive SFML visualizer
 make sfml_standalone  # Standalone launcher
@@ -43,52 +42,11 @@ make install-deps     # Install system dependencies
 
 ---
 
-## Three Execution Modes
+## Execution Modes
 
-### Mode 1: Terminal (ncurses) — **Two Views**
+### Mode 1: SFML Arbiter (Full Game + Visualizer UI) — **RECOMMENDED**
 
-The original terminal-based UI using ncurses. Press **Tab** to toggle between:
-- **Combat View** [Tab]: Character cards, HP/stamina bars, inventory, artifacts, logs
-- **Scheduler View** [Tab]: Process blocks, Gantt timeline, state indicators (READY/RUNNING/BLOCKED), OS metrics
-
-```bash
-# Build
-make legacy
-
-# Run (recommended: use launcher to avoid stdin conflicts)
-./sfml_ui/chrono_rift_standalone --ncurses
-# or via Makefile (prompts for input first):
-make run-legacy
-
-# Manual multi-terminal:
-./arbiter/arbiter    # Terminal 1: Enter roll and party size when prompted
-./hip/hip             # Terminal 2: Player input
-./asp/asp             # Terminal 3: AI opponent
-```
-
-**Controls:**
-- `Tab` — Toggle between Combat and Scheduler views
-- `Ctrl+C` — Force quit all processes
-
-**Combat View Features:**
-- Color-coded panels (green=players, red=NPCs)
-- HP bars with blinking critical indicator
-- Stamina pip display
-- Inventory bar with weapon abbreviations (SC, LB, IH, VD, etc.)
-- Artifact status with waiting queues
-- Recent log panel
-
-**Scheduler View Features:**
-- Process blocks for each NPC (state: RUNNING/READY/BLOCKED)
-- Resource slots for each player (state: RUNNING/READY/BLOCKED)
-- Gantt-style turn history timeline
-- OS metrics: process states, throughput, kills/turn
-
----
-
-### Mode 2: SFML Arbiter (Full Game + Visualizer UI) — **RECOMMENDED**
-
-The complete game with beautiful SFML visualization. Three view modes via keyboard:
+The complete game with SFML visualization. Three view modes via keyboard:
 
 ```bash
 # Build everything
@@ -120,7 +78,7 @@ make all
 
 ---
 
-### Mode 3: Passive SFML Visualizer
+### Mode 2: Passive SFML Visualizer
 
 A standalone visualizer that connects to an already-running arbiter.
 
@@ -128,8 +86,8 @@ A standalone visualizer that connects to an already-running arbiter.
 # Build
 make sfml
 
-# First, start any arbiter:
-./sfml_ui/sfml_arbiter 42 3   # or ./arbiter/arbiter
+# First, start the arbiter:
+./sfml_ui/sfml_arbiter 42 3
 
 # Then, in another terminal:
 ./sfml_ui/chrono_rift_visualizer
@@ -137,7 +95,7 @@ make sfml
 
 ---
 
-### Mode 4: Docker (WSL)
+### Mode 3: Docker (WSL)
 
 Run the entire multi-process game inside a container. This is the most reliable way to handle dependencies and GUI setup on Windows.
 
@@ -219,9 +177,8 @@ docker-compose run --rm game
            │                 │                 │
     ┌──────▼──────┐   ┌──────▼──────┐   ┌──────▼──────┐
     │  ARBITER    │   │     HIP     │   │     ASP     │
-    │ (ncurses or │   │ (Human      │   │ (AI         │
-    │  sfml_ui)   │   │  Players)   │   │  Opponents) │
-    │             │   │             │   │             │
+    │ (SFML UI)   │   │ (Human      │   │ (AI         │
+    │             │   │  Players)   │   │  Opponents) │
     │ Threads:    │   │ Threads:    │   │ Threads:    │
     │ • render    │   │ • player[0]│   │ • npc[0..n]  │
     │ • deadlock  │   │ • player[1]│   │             │
@@ -255,9 +212,7 @@ When launching multiple processes manually, stdin becomes contested:
 
 ### The Solution
 
-**For ncurses mode:** Use `./sfml_ui/chrono_rift_standalone --ncurses` which pipes input to the arbiter.
-
-**For SFML mode:** The standalone launcher prompts for input **BEFORE** forking, then passes values as command-line arguments.
+The standalone launcher prompts for input **BEFORE** forking, then passes values as command-line arguments.
 
 **For manual mode:** Launch arbiter first, wait 1 second, then launch HIP and ASP.
 
@@ -270,7 +225,7 @@ When launching multiple processes manually, stdin becomes contested:
 | `shm_open: No such file or directory` | Run arbiter first (creates shared memory) |
 | `Failed to load font` | Install fonts: `sudo apt-get install fonts-dejavu` |
 | SFML window not appearing | Check X11 forwarding (WSL: install VcXsrv) |
-| Input goes to wrong process | Use `make run-legacy` or standalone launcher |
+| Input goes to wrong process | Use standalone launcher |
 | Build fails on Windows | Use WSL, MSYS2, or Docker environment |
 
 ---
@@ -278,12 +233,9 @@ When launching multiple processes manually, stdin becomes contested:
 ## File Structure
 
 ```
-chrono_rift_merged/
+chrono_rift/
 ├── shared.hpp              — Shared data structures & types
 ├── common.hpp              — Utility functions (shm_open, weapon ops)
-│
-├── arbiter/
-│   └── arbiter.cpp         — NCurses arbiter (game logic + 2-view TUI)
 │
 ├── hip/
 │   └── hip.cpp             — Human Interfacing Process (player input)
@@ -294,16 +246,17 @@ chrono_rift_merged/
 ├── sfml_ui/
 │   ├── sfml_arbiter.cpp    — SFML Arbiter (game logic + Visualizer UI)
 │   ├── main.cpp            — Passive visualizer (connects to arbiter)
-│   ├── standalone_main.cpp — Multi-process launcher (ncurses + SFML modes)
+│   ├── standalone_main.cpp — Multi-process launcher
 │   ├── Visualizer.hpp/cpp  — Full SFML Visualizer (3 view modes)
 │   ├── UIComponents.hpp/cpp — UI elements (CharacterCard, Button, etc.)
 │   ├── UITheme.hpp         — Neon dark theme colors & constants
 │   ├── LogPanel.cpp        — Log message rendering
-│   ├── StandaloneSim.hpp/cpp — Demo simulation (no processes)
-│   └── chrono_rift_standalone — Standalone launcher binary
+│   └── StandaloneSim.hpp/cpp — Demo simulation (no processes)
 │
-├── Makefile                — Complete multi-mode build system
+├── Makefile                — Build system
 ├── CMakeLists.txt          — CMake build configuration
+├── Dockerfile              — Docker image for WSL/Linux
+├── docker-compose.yml      — Docker Compose config
 ├── EXECUTION_GUIDE.md      — This file
 └── README.md               — Project documentation
 ```

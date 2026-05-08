@@ -1,7 +1,7 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════════════════╗
- * ║  CHRONO RIFT — Standalone Multi-Process Launcher (3 Modes)              ║
- * ║  Forks: Arbiter + Console HIP + Headless ASP                            ║
+ * ║  CHRONO RIFT — Standalone Multi-Process Launcher                        ║
+ * ║  Forks: SFML Arbiter + Console HIP + Headless ASP                       ║
  * ╚═══════════════════════════════════════════════════════════════════════════╝
  *
  * Multi-mode launcher that prompts for input BEFORE forking any processes,
@@ -9,7 +9,6 @@
  *
  * Modes:
  *   ./chrono_rift_standalone                 — SFML Arbiter (Visualizer UI)
- *   ./chrono_rift_standalone --ncurses       — NCurses Arbiter (terminal TUI)
  *   ./chrono_rift_standalone --visualizer-only — Passive visualizer only
  *
  * OS Concepts:
@@ -54,12 +53,8 @@ int main(int argc, char* argv[]) {
     std::signal(SIGTERM, signal_handler);
 
     // Parse mode
-    bool ncurses_mode = false;
     bool visualizer_only = false;
     for (int i = 1; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--ncurses") == 0) ncurses_mode = true;
-        if (std::strcmp(argv[i], "--ncurses-only") == 0) ncurses_mode = true;
-        if (std::strcmp(argv[i], "--legacy") == 0) ncurses_mode = true;
         if (std::strcmp(argv[i], "--visualizer-only") == 0) visualizer_only = true;
     }
 
@@ -67,9 +62,7 @@ int main(int argc, char* argv[]) {
     std::cout << "║  CHRONO RIFT — Multi-Process Launcher                         ║\n";
     std::cout << "╠═══════════════════════════════════════════════════════════════╣\n";
 
-    if (ncurses_mode) {
-        std::cout << "║  Mode: NCurses Arbiter (Terminal TUI) + HIP + ASP            ║\n";
-    } else if (visualizer_only) {
+    if (visualizer_only) {
         std::cout << "║  Mode: Passive Visualizer (connect to existing arbiter)       ║\n";
     } else {
         std::cout << "║  Mode: SFML Arbiter (Visualizer UI) + HIP + ASP              ║\n";
@@ -104,12 +97,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Check if binaries exist
-    const char* arbiter_path;
-    if (ncurses_mode) {
-        arbiter_path = "./arbiter/arbiter";
-    } else {
-        arbiter_path = "./sfml_ui/sfml_arbiter";
-    }
+    const char* arbiter_path = "./sfml_ui/sfml_arbiter";
     const char* hip_path = "./hip/hip";
     const char* asp_path = "./asp/asp";
 
@@ -128,46 +116,14 @@ int main(int argc, char* argv[]) {
     }
 
     // ── Fork 1: Arbiter ───────────────────────────────────────────────────
-    std::cout << "[1/3] Launching " << (ncurses_mode ? "ncurses Arbiter" : "SFML Arbiter") << "...\n";
+    std::cout << "[1/3] Launching SFML Arbiter...\n";
 
     pid_t arbiter_pid = fork();
     if (arbiter_pid == 0) {
-        // Child: run arbiter.
-        // For SFML arbiter: pass roll and party as arguments (no stdin needed).
-        // For ncurses arbiter: stdin is inherited from parent — the parent has
-        // already consumed input, so ncurses reads from a clean stdin (though it
-        // will still prompt since stdin is the terminal and ncurses captures it).
-        if (ncurses_mode) {
-            // NCurses arbiter: needs to read from stdin, so we need to pipe input.
-            // Use a pipe to pass roll and party.
-            int pipefd[2];
-            if (pipe(pipefd) == 0) {
-                pid_t child_pid = fork();
-                if (child_pid == 0) {
-                    // Grandchild: run arbiter with piped input
-                    close(pipefd[1]);
-                    dup2(pipefd[0], STDIN_FILENO);
-                    close(pipefd[0]);
-                    execl(arbiter_path, "arbiter", (char*)nullptr);
-                    _exit(1);
-                }
-                // Child: write roll and party to pipe
-                close(pipefd[0]);
-                char buf[64];
-                int len = std::snprintf(buf, sizeof(buf), "%d\n%d\n", roll, party);
-                write(pipefd[1], buf, static_cast<size_t>(len));
-                close(pipefd[1]);
-                waitpid(child_pid, nullptr, 0);
-                _exit(0);
-            }
-            close(pipefd[0]);
-            close(pipefd[1]);
-        } else {
-            execl(arbiter_path, ncurses_mode ? "arbiter" : "sfml_arbiter",
-                  std::to_string(roll).c_str(),
-                  std::to_string(party).c_str(),
-                  (char*)nullptr);
-        }
+        execl(arbiter_path, "sfml_arbiter",
+              std::to_string(roll).c_str(),
+              std::to_string(party).c_str(),
+              (char*)nullptr);
         perror("execl arbiter");
         _exit(1);
     }
@@ -215,7 +171,7 @@ int main(int argc, char* argv[]) {
     std::cout << "  HIP PID:     " << hip_pid << "\n";
     std::cout << "  ASP PID:     " << asp_pid << "\n";
     std::cout << "\nInstructions:\n";
-    std::cout << "  - Watch the " << (ncurses_mode ? "terminal" : "SFML window") << " for game state\n";
+    std::cout << "  - Watch the SFML window for game state\n";
     std::cout << "  - Enter player actions in this terminal when prompted (HIP)\n";
     std::cout << "  - Press Ctrl+C to force quit all processes\n\n";
 

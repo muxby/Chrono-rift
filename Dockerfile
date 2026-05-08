@@ -17,8 +17,6 @@ RUN apt-get update && apt-get install -y \
     make \
     cmake \
     libsfml-dev \
-    libncurses5-dev \
-    libncursesw5-dev \
     libpthread-stubs0-dev \
     libx11-dev \
     fonts-dejavu \

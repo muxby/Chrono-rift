@@ -1,0 +1,19 @@
+# Compiled binaries
+hip/hip
+asp/asp
+sfml_ui/sfml_arbiter
+sfml_ui/chrono_rift_visualizer
+sfml_ui/chrono_rift_standalone
+
+# Object files
+*.o
+
+# Build directories
+build/
+
+# IDE / editor
+.vscode/
+.idea/
+
+# Claude Code
+.claude/

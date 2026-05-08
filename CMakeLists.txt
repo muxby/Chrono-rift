@@ -1,6 +1,6 @@
 # ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║  CHRONO RIFT — Complete Multi-Mode CMake Build                          ║
-# ║  Three Modes: Terminal (ncurses) | SFML Visualizer | Standalone        ║
+# ║  CHRONO RIFT — SFML CMake Build                                         ║
+# ║  Modes: SFML Arbiter | SFML Visualizer | Standalone Launcher            ║
 # ╚═══════════════════════════════════════════════════════════════════════════╝
 
 cmake_minimum_required(VERSION 3.16)
@@ -16,14 +16,8 @@ find_package(SFML 2.5 COMPONENTS graphics window system REQUIRED)
 find_package(Threads REQUIRED)
 
 # ═══════════════════════════════════════════════════════════════════════════
-# MODE 1: LEGACY TARGETS (Terminal ncurses Arbiter + HIP + ASP)
+# PROCESS MODULES (HIP + ASP — no UI dependency)
 # ═══════════════════════════════════════════════════════════════════════════
-
-# Arbiter (ncurses TUI)
-add_executable(arbiter_original arbiter/arbiter.cpp)
-target_include_directories(arbiter_original PRIVATE ${CMAKE_SOURCE_DIR})
-target_link_libraries(arbiter_original PRIVATE ncurses Threads::Threads rt)
-set_target_properties(arbiter_original PROPERTIES OUTPUT_NAME "arbiter/arbiter")
 
 # HIP (Human Interface Player)
 add_executable(hip_original hip/hip.cpp)
@@ -38,7 +32,7 @@ target_link_libraries(asp_original PRIVATE Threads::Threads rt)
 set_target_properties(asp_original PROPERTIES OUTPUT_NAME "asp/asp")
 
 # ═══════════════════════════════════════════════════════════════════════════
-# MODE 2: SFML ARBITER (Complete Game + Visualizer UI)
+# SFML ARBITER (Complete Game + Visualizer UI)
 # ═══════════════════════════════════════════════════════════════════════════
 
 # Visualizer UI library (shared)
@@ -83,7 +77,7 @@ set_target_properties(sfml_arbiter PROPERTIES
 )
 
 # ═══════════════════════════════════════════════════════════════════════════
-# MODE 3: PASSIVE SFML VISUALIZER (connects to shared memory)
+# PASSIVE SFML VISUALIZER (connects to shared memory)
 # ═══════════════════════════════════════════════════════════════════════════
 
 add_executable(chrono_rift_visualizer
@@ -136,7 +130,6 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(chrono_rift_visualizer PRIVATE -Wall -Wextra -O2)
     target_compile_options(sfml_arbiter PRIVATE -Wall -Wextra -O2)
     target_compile_options(chrono_rift_standalone PRIVATE -Wall -Wextra -O2)
-    target_compile_options(arbiter_original PRIVATE -Wall -Wextra)
     target_compile_options(hip_original PRIVATE -Wall -Wextra)
     target_compile_options(asp_original PRIVATE -Wall -Wextra)
 endif()
@@ -149,7 +142,6 @@ install(TARGETS
     sfml_arbiter
     chrono_rift_visualizer
     chrono_rift_standalone
-    arbiter_original
     hip_original
     asp_original
     RUNTIME DESTINATION bin

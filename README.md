@@ -12,26 +12,22 @@ A multi-process tactical game demonstrating core operating system concepts inclu
 
 ```bash
 # Install dependencies
-sudo apt-get update && sudo apt-get install -y libsfml-dev g++ make libncurses5-dev
+sudo apt-get update && sudo apt-get install -y libsfml-dev g++ make
 
 # Build everything
 make all
 
-# Run (SFML recommended)
+# Run (recommended)
 ./sfml_ui/sfml_arbiter 42 3
 
 # Or with launcher (prompts for input first, no stdin conflicts)
 ./sfml_ui/chrono_rift_standalone
-
-# Or run in terminal mode (ncurses)
-./sfml_ui/chrono_rift_standalone --ncurses
 ```
 
-## Three Execution Modes
+## Execution Modes
 
 | Mode | Binary | Description |
 |------|--------|-------------|
-| **NCurses (Terminal)** | `./arbiter/arbiter` | Two views: Combat + Scheduler (Tab toggle) |
 | **SFML Arbiter** | `./sfml_ui/sfml_arbiter` | Three views: Combat/Scheduler/Hybrid (1/2/3 keys) |
 | **SFML Visualizer** | `./sfml_ui/chrono_rift_visualizer` | Passive, connects to running arbiter |
 
@@ -41,22 +37,23 @@ make all
 |---------|-------------------|
 | Process Management | `standalone_main.cpp` — fork/exec of 3 processes |
 | Shared Memory IPC | `common.hpp:map_shared()` — shm_open + mmap |
-| Threading | `arbiter.cpp` — 3 threads: render, deadlock_monitor, turn_scheduler |
-| Synchronization | `arbiter.cpp:init_state()` — pthread_mutex + condvar (PTHREAD_PROCESS_SHARED) |
+| Threading | `sfml_arbiter.cpp` — 3 threads: render, deadlock_monitor, turn_scheduler |
+| Synchronization | `sfml_arbiter.cpp:init_state()` — pthread_mutex + condvar (PTHREAD_PROCESS_SHARED) |
 | Signal-based Stun | `hip.cpp`, `asp.cpp` — SIGUSR1 async delivery |
-| Deadlock Detection | `arbiter.cpp:deadlock_monitor()` — circular wait on artifacts |
-| CPU Scheduling | `arbiter.cpp:schedule_next_turn()` — stamina-based priority scheduling |
-| Real-time Visualization | `arbiter.cpp:render_thread()` — NCurses TUI with 2 views |
+| Deadlock Detection | `sfml_arbiter.cpp:deadlock_monitor()` — circular wait on artifacts |
+| CPU Scheduling | `sfml_arbiter.cpp:schedule_next_turn()` — stamina-based priority scheduling |
+| Real-time Visualization | `Visualizer.cpp` — SFML UI with 3 view modes |
 
 ## File Structure
 
 ```
-chrono_rift_merged/
+chrono_rift/
 ├── shared.hpp              — Shared data structures & types
 ├── common.hpp              — Utility functions (shm_open, weapon ops)
-├── arbiter/arbiter.cpp     — NCurses arbiter (game logic + 2-view TUI)
-├── hip/hip.cpp             — Human Interfacing Process
-├── asp/asp.cpp             — Automated Strategic Process (AI)
+├── hip/
+│   └── hip.cpp             — Human Interfacing Process
+├── asp/
+│   └── asp.cpp             — Automated Strategic Process (AI)
 ├── sfml_ui/
 │   ├── sfml_arbiter.cpp    — SFML arbiter (game logic + Visualizer UI)
 │   ├── main.cpp            — Passive SFML visualizer
@@ -64,7 +61,7 @@ chrono_rift_merged/
 │   ├── Visualizer.hpp/cpp  — SFML Visualizer (3 view modes)
 │   ├── UIComponents.hpp/cpp — UI elements
 │   └── UITheme.hpp         — Neon dark theme
-├── Makefile                — Build system (all modes)
+├── Makefile                — Build system
 ├── CMakeLists.txt          — CMake configuration
 ├── EXECUTION_GUIDE.md      — Full documentation
 └── README.md               — This file
@@ -83,17 +80,10 @@ Original `hip.cpp` held the mutex while reading from stdin. Fixed by:
 - Reading stdin outside the mutex lock
 - Submitting the action atomically inside the critical section
 
-### NCurses Scheduler View
-Added Tab-toggle to ncurses arbiter showing:
-- Process blocks with state indicators (RUNNING/READY/BLOCKED)
-- Gantt-style turn history
-- OS metrics (process states, throughput)
-
 ## Build Targets
 
 ```bash
 make all              # Everything
-make legacy           # NCurses only
 make sfml_arbiter     # SFML arbiter
 make sfml             # Passive visualizer
 make sfml_standalone  # Launcher

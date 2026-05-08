@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  game:
+    build: .
+    image: chrono-rift
+    container_name: chrono-rift-container
+    environment:
+      # Pass the display variable from WSL to the container
+      - DISPLAY=${DISPLAY:-:0}
+    volumes:
+      # Mount X11 socket for GUI pass-through
+      - /tmp/.X11-unix:/tmp/.X11-unix
+    # stdin_open and tty are required for interactive HIP (Player Input)
+    stdin_open: true
+    tty: true
+    # Ensures shared memory is sufficient (default is usually enough, but safety first)
+    shm_size: '128mb'

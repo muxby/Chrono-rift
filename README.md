@@ -3,10 +3,9 @@
 A multi-process tactical game demonstrating core operating system concepts including process synchronization, inter-process communication, deadlocks, stun mechanics via signal delivery, and custom CPU scheduling.
 
 ## Group Members
+Mubeen Khalid (24i-0605)
+Muhammad Abubakar (24i-0753)
 
-- Aisha Ishtiaq (24K-0559)
-- Fizza (24K-0562)
-- Rameen Afzal (24K-0590)
 
 ## Quick Start
 

@@ -4,14 +4,12 @@
 #include "../shared.hpp"
 #include <SFML/Graphics.hpp>
 #include <string>
-#include <vector>
-#include <functional>
 
 namespace ChronoRift {
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ---
 // UI COMPONENTS — Reusable SFML UI Elements
-// ═══════════════════════════════════════════════════════════════════════════
+// ---
 
 // ── Progress Bar ──────────────────────────────────────────────────────────
 class ProgressBar {
@@ -38,9 +36,11 @@ public:
     void draw(sf::RenderWindow& window);
     bool handleEvent(const sf::Event& event, const sf::RenderWindow& window);
     void setColors(sf::Color normal, sf::Color hover, sf::Color text);
-    void setCallback(std::function<void()> cb);
+    void setCallback(void (*cb)(void*), void* ctx);
+    void setCallbackWithTag(void (*cb)(void*, int), void* ctx, int tag);
     void setText(const std::string& text);
     bool isHovered() const { return hovered; }
+    int getTag() const { return tag; }
 
 private:
     sf::RectangleShape shape;
@@ -48,8 +48,11 @@ private:
     sf::Color normalColor;
     sf::Color hoverColor;
     sf::Color textColor;
-    std::function<void()> callback;
     bool hovered;
+    void (*callback)(void*);
+    void (*callbackWithTag)(void*, int);
+    void* callbackCtx;
+    int tag;
 };
 
 // ── Slider Control ────────────────────────────────────────────────────────
@@ -116,6 +119,8 @@ private:
 };
 
 // ── Log Panel ─────────────────────────────────────────────────────────────
+static constexpr int MAX_LOG_ENTRIES = 20;
+
 class LogPanel {
 public:
     LogPanel(float x, float y, float width, float height, sf::Font& font);
@@ -125,9 +130,10 @@ public:
 private:
     sf::RectangleShape bg;
     sf::Text headerText;
-    std::vector<sf::Text> logEntries;
-    float x, y, width, height;
+    sf::Text logEntries[MAX_LOG_ENTRIES];
     sf::Font& font;
+    int logCount;
+    float x, y, width, height;
 };
 
 // ── Metrics Dashboard ─────────────────────────────────────────────────────
@@ -149,6 +155,8 @@ private:
 };
 
 // ── Gantt Chart (using sf::VertexArray) ───────────────────────────────────
+static constexpr int MAX_GANTT_ENTRIES = 256;
+
 class GanttChart {
 public:
     GanttChart(float x, float y, float width, float height, sf::Font& font);
@@ -169,9 +177,10 @@ private:
     sf::Font& font;
     sf::Text headerText;
     sf::Text timeText;
-    std::vector<GanttEntry> entries;
+    GanttEntry entries[MAX_GANTT_ENTRIES];
+    int entryCount;
     float currentTime;
-    float timeWindow; // How many seconds to show
+    float timeWindow;
 
     void drawGrid(sf::RenderWindow& window);
     void drawEntries(sf::RenderWindow& window);
@@ -217,7 +226,7 @@ private:
     sf::Text nameText;
     sf::Text pidText;
     sf::Text stateText;
-    int currentState; // 0=running, 1=ready, 2=blocked
+    int currentState;
 };
 
 // ── HIP Resource Slot ─────────────────────────────────────────────────────
@@ -243,6 +252,8 @@ private:
 };
 
 // ── Particle System for Visual Effects ────────────────────────────────────
+static constexpr int MAX_PARTICLES = 512;
+
 class ParticleSystem {
 public:
     ParticleSystem();
@@ -257,7 +268,8 @@ private:
         float lifetime;
         float maxLifetime;
     };
-    std::vector<Particle> particles;
+    Particle particles[MAX_PARTICLES];
+    int particleCount;
 };
 
 // ── Connection Line (for showing Arbiter polling) ─────────────────────────

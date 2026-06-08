@@ -40,7 +40,9 @@ ALL_TARGETS  = $(PROCESS_TARGETS) $(SFML_ARBITER) $(SFML_TARGET) $(SFML_STANDALO
 VISUALIZER_SOURCES = \
 	sfml_ui/Visualizer.cpp \
 	sfml_ui/UIComponents.cpp \
-	sfml_ui/LogPanel.cpp
+	sfml_ui/LogPanel.cpp \
+	sfml_ui/ThreadPool.cpp \
+	sfml_ui/SpriteAnimation.cpp
 
 VISUALIZER_OBJECTS = $(VISUALIZER_SOURCES:.cpp=.o)
 
@@ -49,7 +51,7 @@ VISUALIZER_OBJECTS = $(VISUALIZER_SOURCES:.cpp=.o)
 # ═══════════════════════════════════════════════════════════════════════════
 
 .PHONY: all clean debug sfml sfml_standalone sfml_arbiter install-deps help \
-        run run-sfml-arbiter run-standalone run-visualizer
+        run run-sfml-arbiter run-standalone run-visualizer test check
 
 # Default: build everything
 all: $(PROCESS_TARGETS) sfml_arbiter sfml sfml_standalone
@@ -69,6 +71,7 @@ all: $(PROCESS_TARGETS) sfml_arbiter sfml sfml_standalone
 	@echo "║                                                                   ║"
 	@echo "║  Standalone Launcher:                                             ║"
 	@echo "║    ./sfml_ui/chrono_rift_standalone                               ║"
+	@echo "║  Smoke Test:   make test                                           ║"
 	@echo "╚═══════════════════════════════════════════════════════════════════╝"
 
 # ── Process targets (HIP + ASP, no UI dependency) ─────────────────────────
@@ -85,9 +88,9 @@ asp/asp: asp/asp.cpp shared.hpp common.hpp
 # ── SFML Arbiter (complete game logic + Visualizer UI) ───────────────────
 sfml_arbiter: $(SFML_ARBITER)
 
-$(SFML_ARBITER): sfml_ui/sfml_arbiter.cpp $(VISUALIZER_OBJECTS) shared.hpp common.hpp
+$(SFML_ARBITER): sfml_ui/sfml_arbiter.cpp memory_demo.cpp $(VISUALIZER_OBJECTS) shared.hpp common.hpp
 	@mkdir -p sfml_ui
-	$(CXX) $(CXXFLAGS) sfml_ui/sfml_arbiter.cpp $(VISUALIZER_OBJECTS) -o $@ $(SFML_LIBS) $(SYS_LIBS)
+	$(CXX) $(CXXFLAGS) sfml_ui/sfml_arbiter.cpp memory_demo.cpp $(VISUALIZER_OBJECTS) -o $@ $(SFML_LIBS) $(SYS_LIBS)
 	@echo "[OK] Built: $(SFML_ARBITER)"
 
 # ── SFML Visualizer (connects to shared memory) ───────────────────────────
@@ -97,7 +100,8 @@ VISUALIZER_ONLY_SOURCES = \
 	sfml_ui/main.cpp \
 	sfml_ui/Visualizer.cpp \
 	sfml_ui/UIComponents.cpp \
-	sfml_ui/LogPanel.cpp
+	sfml_ui/LogPanel.cpp \
+	sfml_ui/SpriteAnimation.cpp
 
 VISUALIZER_ONLY_OBJECTS = $(VISUALIZER_ONLY_SOURCES:.cpp=.o)
 
@@ -178,6 +182,36 @@ install-deps:
 	sudo apt-get install -y libsfml-dev g++ make
 	@echo "[OK] Dependencies installed"
 
+# ── Docker targets ───────────────────────────────────────────────────────
+docker-build:
+	docker build -t chrono-rift .
+
+docker-run:
+	docker-compose up game
+
+docker-clean:
+	docker-compose down
+	docker rmi chrono-rift
+
+# ── Smoke test ───────────────────────────────────────────────────────────────
+test: all
+	@echo ""
+	@echo "Running smoke tests..."
+	@test -x hip/hip && echo "  hip: OK" || echo "  hip: MISSING"
+	@test -x asp/asp && echo "  asp: OK" || echo "  asp: MISSING"
+	@test -x sfml_ui/sfml_arbiter && echo "  sfml_arbiter: OK" || echo "  sfml_arbiter: MISSING"
+	@test -x sfml_ui/chrono_rift_visualizer && echo "  visualizer: OK" || echo "  visualizer: MISSING"
+	@test -x sfml_ui/chrono_rift_standalone && echo "  standalone: OK" || echo "  standalone: MISSING"
+	@./scratch/check_seed 42 >/dev/null 2>&1 && echo "  check_seed: PASS" || echo "  check_seed: FAIL"
+	@echo "[OK] All smoke tests complete"
+
+# ── Binary check ─────────────────────────────────────────────────────────
+check: all
+	@echo ""
+	@echo "Binary sizes:"
+	@ls -lh hip/hip asp/asp sfml_ui/sfml_arbiter sfml_ui/chrono_rift_visualizer sfml_ui/chrono_rift_standalone 2>/dev/null || echo "  Some binaries missing"
+	@echo "[OK] Check complete"
+
 # ── Help ──────────────────────────────────────────────────────────────────
 help:
 	@echo ""
@@ -194,12 +228,20 @@ help:
 	@echo "║    make clean            — Remove all build artifacts             ║"
 	@echo "║    make install-deps     — Install system dependencies            ║"
 	@echo "║                                                                   ║"
+	@echo "║  DOCKER TARGETS:                                                  ║"
+	@echo "║    make docker-build     — Build Docker image                     ║"
+	@echo "║    make docker-run       — Run in Docker (with X11/GUI)           ║"
+	@echo "║    make docker-clean     — Remove Docker artifacts                ║"
+	@echo "║                                                                   ║"
 	@echo "║  RUN TARGETS:                                                     ║"
 	@echo "║    make run-sfml-arbiter — SFML arbiter (manual, prompts input)   ║"
 	@echo "║    make run-standalone   — Auto-launch all (prompts first)        ║"
 	@echo "║    make run-sfml-direct  — SFML arbiter (roll=42, party=3)        ║"
 	@echo "║    make run-visualizer   — Passive visualizer only                ║"
 	@echo "║                                                                   ║"
+	@echo "║  SMOKE TEST TARGETS:                                               ║"
+	@echo "║    make test            — Run smoke tests on all binaries          ║"
+	@echo "║    make check           — Show binary sizes                       ║"
 	@echo "║  TWO MODES:                                                       ║"
 	@echo "║    Mode 1: SFML Arbiter— ./sfml_ui/sfml_arbiter (+ hip + asp)    ║"
 	@echo "║    Mode 2: Visualizer  — ./sfml_ui/chrono_rift_visualizer         ║"

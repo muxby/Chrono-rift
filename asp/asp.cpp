@@ -1,54 +1,20 @@
-/**
- * ╔═══════════════════════════════════════════════════════════════════════════╗
- * ║  ASP — Automated Strategic Process (AI Opponent)                        ║
- * ║  OS Concepts: Threading, Shared Memory IPC, Signal Handling           ║
- * ╚═══════════════════════════════════════════════════════════════════════════╝
- *
- * ASP is the AI opponent manager. Each NPC gets one thread that:
- *   1. Waits on turn_cv until its turn is assigned
- *   2. Checks stun state (via SIGUSR1 signal handler or shared state)
- *   3. If not stunned, submits a random action (80% strike, 20% skip)
- *   4. Signs on action_cv to wake the arbiter
- *
- * OS Concepts Demonstrated:
- *   1. SHARED MEMORY IPC: Attaches to same SharedState region as arbiter/hip
- *   2. THREADING: One pthread per NPC, all coordinating via shared mutex/condvar
- *   3. SIGNAL HANDLING: SIGUSR1 for stun, SIGCONT for resume (from Ultimate)
- *   4. SYNCHRONIZATION: pthread_mutex + pthread_cond for turn coordination
- *
- * The ASP threads do NOT perform I/O (no stdin), so they don't need the
- * unlock-then-submit pattern that HIP uses. They simply build a PendingAction
- * and submit it atomically under the mutex.
- */
+// asp.cpp - enemy AI process, one thread per npc
+// 80% chance to attack, 20% skip. handles stun via SIGUSR1
 
 #include "../common.hpp"
 
-#include <atomic>
 #include <csignal>
 #include <cstdlib>
-#include <thread>
-#include <vector>
-
-// ═══════════════════════════════════════════════════════════════════════════
-// STUN SIGNAL HANDLER — Async signal delivery from arbiter on successful hit
 
 static SharedState* g = nullptr;
-static std::atomic<int> stunned_until{0};
+static volatile sig_atomic_t stunned_until = 0;
 
+// stun handler - arbiter sends SIGUSR1 on stun
 void stun_handler(int) {
-    // Async-signal-safe: atomic store of stun end time.
-    // The NPC thread reads this to skip its turn for 3 seconds.
-    stunned_until.store(now_epoch() + 3);
+    stunned_until = now_epoch() + 3;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// NPC ACTION SUBMISSION — Builds and submits a random AI action
-
-// Submits an NPC action to shared memory.
-// 80% chance: ACT_STRIKE (attack first living player)
-// 20% chance: ACT_SKIP (do nothing)
-//
-// OS Concepts: Shared memory write under mutex, condition variable signal.
+// submit npc action: 80% strike, 20% skip
 void submit_npc_action(int nid) {
     PendingAction a{};
     a.actor_team = TEAM_NPC;
@@ -60,7 +26,7 @@ void submit_npc_action(int nid) {
         a.target_team = TEAM_PLAYER;
         a.target_id = 0;
     } else {
-        a.action = (std::rand() % 100 < 80) ? ACT_STRIKE : ACT_SKIP;
+        a.action = (rand() % 100 < 80) ? ACT_STRIKE : ACT_SKIP;
         a.target_team = TEAM_PLAYER;
         a.target_id = target;
     }
@@ -68,32 +34,31 @@ void submit_npc_action(int nid) {
     g->pending = a;
     g->pending.ready = 1;
     pthread_cond_signal(&g->action_cv);
+    pthread_mutex_unlock(&g->mtx);
+    sem_post(&g->action_sem);
+    pthread_mutex_lock(&g->mtx);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// NPC THREAD — Per-NPC thread waiting for turn assignment
-
+// one of these runs per npc, waits for its turn then submits an action
 void* npc_thread(void* arg) {
     int nid = *static_cast<int*>(arg);
     delete static_cast<int*>(arg);
 
-    // Wait for arbiter to initialize shared state
     pthread_mutex_lock(&g->mtx);
     while (!g->initialized) pthread_cond_wait(&g->turn_cv, &g->mtx);
 
     while (g->running) {
-        // Wait until THIS NPC's turn (active_team==TEAM_NPC && active_id==nid)
+        // wait for this npc's turn — arbiter broadcasts turn_cv when active changes
         while (g->running && !(g->active_team == TEAM_NPC && g->active_id == nid)) {
             pthread_cond_wait(&g->turn_cv, &g->mtx);
         }
         if (!g->running) break;
 
-        // Skip if dead
         if (!g->npcs[nid].alive) continue;
 
-        // Check stun: either from signal (stunned_until atomic) or in-game stun
+        // Check stun state
         int now = now_epoch();
-        if (now < stunned_until.load() || now < g->npcs[nid].stunned_until_epoch) {
+        if (now < stunned_until || now < g->npcs[nid].stunned_until_epoch) {
             PendingAction s{};
             s.action = ACT_SKIP;
             s.actor_team = TEAM_NPC;
@@ -101,10 +66,13 @@ void* npc_thread(void* arg) {
             g->pending = s;
             g->pending.ready = 1;
             pthread_cond_signal(&g->action_cv);
+            pthread_mutex_unlock(&g->mtx);
+            sem_post(&g->action_sem);
+            pthread_mutex_lock(&g->mtx);
             continue;
         }
 
-        // Not stunned — submit AI action
+        // not stunned, submit ai action
         submit_npc_action(nid);
     }
 
@@ -112,31 +80,45 @@ void* npc_thread(void* arg) {
     return nullptr;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// MAIN — Attach to shared memory, spawn NPC threads
+// separate thread just for recieving stun signals, keeps npc threads clean
+void* signal_thread(void* arg) {
+    sigset_t mask, oldmask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGUSR1);
+    sigprocmask(SIG_BLOCK, &mask, &oldmask);
+
+    while (g->running) {
+        sigsuspend(&oldmask);
+        // stun_handler already ran, stunned_until is set
+    }
+    return nullptr;
+}
 
 int main() {
-    // Register SIGUSR1 for stun (sent by arbiter on successful hit)
     signal(SIGUSR1, stun_handler);
 
-    // Shared Memory IPC: Attach to existing shared memory region
     g = map_shared(false);
     if (!g) return 1;
 
-    // Let arbiter know our PID (for SIGUSR1 delivery and Ultimate pause)
     g->asp_pid = getpid();
 
-    // Threading: Spawn one thread per NPC (OS Concept: pthread_create)
-    std::vector<pthread_t> threads(g->num_npcs);
+    // spawn one thread per npc
+    pthread_t threads[MAX_NPCS];
     for (int i = 0; i < g->num_npcs; ++i) {
         int* id = new int(i);
         pthread_create(&threads[i], nullptr, npc_thread, id);
     }
 
-    // Wait for all NPC threads to finish
-    for (auto& t : threads) pthread_join(t, nullptr);
+    // spawn a dedicated signal-handler thread (detached)
+    pthread_t sig_thr;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_create(&sig_thr, &attr, signal_thread, nullptr);
+    pthread_attr_destroy(&attr);
 
-    // Cleanup: Unmap shared memory (OS Concept: munmap)
-    munmap(g, sizeof(SharedState));
+    for (int i = 0; i < g->num_npcs; ++i) pthread_join(threads[i], nullptr);
+
+    cleanup_shared(g, false);
     return 0;
 }

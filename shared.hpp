@@ -1,28 +1,4 @@
-/**
- * ╔═══════════════════════════════════════════════════════════════════════════╗
- * ║  SHARED.HPP — Shared Data Structures for Chrono Rift                   ║
- * ║  OS Concepts: Shared Memory IPC, Data Structures                        ║
- * ╚═══════════════════════════════════════════════════════════════════════════╝
- *
- * This file defines all data structures that live in POSIX shared memory.
- * They are accessed by three processes: Arbiter (arbiter.cpp), HIP (hip.cpp),
- * and ASP (asp.cpp) through the /dev/shm/chrono_rift_shm region.
- *
- * OS Concepts:
- *   - SHARED MEMORY IPC: All structs below are memory-mapped and accessible
- *     across process boundaries. No serialization needed.
- *   - PROCESS-SHARED SYNCHRONIZATION: pthread_mutex_t and pthread_cond_t
- *     must be initialized with PTHREAD_PROCESS_SHARED attribute (done in
- *     arbiter.cpp:init_state()).
- *   - DATA LAYOUT: Structures use fixed-size types (int, char[]) to ensure
- *     consistent layout across processes on the same architecture.
- *
- * Key Structures:
- *   - SharedState: Root structure containing all game state
- *   - CharacterState: Per-character data (HP, stamina, inventory, storage)
- *   - ArtifactState: Artifact metadata (holder, waiting queue)
- *   - PendingAction: In-flight action from HIP/ASP to Arbiter
- */
+// shared.hpp - all structs that live in shared memory between the 3 processes
 
 #pragma once
 
@@ -30,70 +6,69 @@
 #include <semaphore.h>
 #include <signal.h>
 
-// ═══════════════════════════════════════════════════════════════════════════
-// SHARED MEMORY NAME — POSIX shared memory object path
-// ═══════════════════════════════════════════════════════════════════════════
-
+// shared memory object name
 constexpr const char* SHM_NAME = "/chrono_rift_shm";
 
-// ═══════════════════════════════════════════════════════════════════════════
-// SYSTEM LIMITS — Array sizes for fixed-size structures in shared memory
-// ═══════════════════════════════════════════════════════════════════════════
+// limits for fixed-size arrays
+constexpr int MAX_PLAYERS   = 4;
+constexpr int MAX_NPCS      = 9;
+constexpr int INVENTORY_SLOTS = 20;
+constexpr int MAX_STORAGE   = 32;
+constexpr int MAX_LOG       = 64;
+constexpr int MAX_LOG_LEN   = 256;
+constexpr int MAX_WAITING   = 16;
 
-constexpr int MAX_PLAYERS   = 4;   // Max human players
-constexpr int MAX_NPCS      = 9;   // Max NPC enemies
-constexpr int INVENTORY_SLOTS = 20; // Inventory slots per character
-constexpr int MAX_STORAGE   = 32; // Storage slots per character
-constexpr int MAX_LOG       = 64;  // Circular log buffer size
-constexpr int MAX_LOG_LEN   = 128; // Max characters per log entry
-constexpr int MAX_WAITING   = 16;  // Max waiters on a single artifact
-
-// ═══════════════════════════════════════════════════════════════════════════
-// ENUMERATIONS
-// ═══════════════════════════════════════════════════════════════════════════
-
-// Team classification — used to route actions and identify character type.
+// teams
 enum TeamType { TEAM_PLAYER = 0, TEAM_NPC = 1 };
 
-// All possible player/NPC actions in the game.
-// OS Concept: Action types map to scheduling decisions.
-enum ActionType {
-    ACT_NONE     = 0,
-    ACT_STRIKE   = 1,  // Basic melee attack
-    ACT_EXHAUST  = 2,  // Drain target stamina
-    ACT_USE_WEAPON = 3,// Equip and use a weapon
-    ACT_SWAP_IN  = 4,  // Retrieve weapon from storage
-    ACT_HEAL     = 5,  // Restore 10% HP
-    ACT_SKIP     = 6,  // Skip turn, retain 50% stamina
-    ACT_ULTIMATE = 7,  // Special (requires Solar Core + Lunar Blade)
-    ACT_QUIT     = 8   // Terminate game
+// scheduling modes selectable at runtime
+enum SchedulerMode {
+    SCHED_STAMINA   = 0,   // existing stamina-based scheduling
+    SCHED_MODE_RR   = 1,   // round-robin, alternating player/NPC
+    SCHED_MODE_FIFO = 2,   // strict arrival order by index
+    SCHED_PRIORITY  = 3    // highest speed acts first
 };
 
-// Weapon definitions — each weapon occupies a fixed number of inventory slots.
-// OS Concept: Resource management — slot allocation is a packing problem.
+// different ways to handle deadlock, switchable at runtime
+enum DeadlockStrategy {
+    DETECT_ONLY = 0,      // detect circular wait and force release (existing)
+    NO_HOLD_WAIT = 1,      // force release of held artifact before acquiring new
+    PREEMPT = 2           // preempt lower-priority artifact holder
+};
+
+// all possible actions a character can take
+enum ActionType {
+    ACT_NONE     = 0,
+    ACT_STRIKE   = 1,
+    ACT_EXHAUST  = 2,
+    ACT_USE_WEAPON = 3,
+    ACT_SWAP_IN  = 4,
+    ACT_HEAL     = 5,
+    ACT_SKIP     = 6,
+    ACT_ULTIMATE = 7,
+    ACT_QUIT     = 8
+};
+
+// weapon ids - each weapon takes a certain number of inventory slots
 enum WeaponId {
     W_NONE         = 0,
-    W_SOLAR_CORE   = 1,  // Artifact: 10 slots, 95 dmg
-    W_LUNAR_BLADE  = 2,  // Artifact: 10 slots, 90 dmg
+    W_SOLAR_CORE   = 1,  // 10 slots, 95 dmg (artifact)
+    W_LUNAR_BLADE  = 2,  // 10 slots, 90 dmg (artifact)
     W_IRON_HALBERD = 3,  // 7 slots, 55 dmg
     W_VENOM_DAGGER = 4,  // 4 slots, 30 dmg
     W_THUNDERSTAFF = 5,  // 6 slots, 50 dmg
     W_OBSIDIAN_AXE = 6,  // 5 slots, 45 dmg
     W_FROSTBOW     = 7,  // 6 slots, 48 dmg
     W_SPLINTER_STICK = 8,// 2 slots, 12 dmg
-    W_ECLIPSE_RELIC = 9  // Artifact: 3 slots, 60 dmg (spawns randomly)
+    W_ECLIPSE_RELIC = 9  // 3 slots, 60 dmg (dynamic artifact)
 };
 
-// ═══════════════════════════════════════════════════════════════════════════
-// WEAPON DEFINITIONS — Static table for weapon metadata
-// ═══════════════════════════════════════════════════════════════════════════
-
-// OS Concept: Static resource table — weapons are shared global constants.
+// weapon stats table
 struct WeaponDef {
     WeaponId id;
     const char* name;
-    int slots;   // Inventory space required
-    int damage;  // Damage dealt per hit
+    int slots;
+    int damage;
 };
 
 constexpr WeaponDef WEAPONS[] = {
@@ -109,117 +84,105 @@ constexpr WeaponDef WEAPONS[] = {
     {W_ECLIPSE_RELIC,"Eclipse Relic",   3,  60}
 };
 
-// ═══════════════════════════════════════════════════════════════════════════
-// CHARACTER STATE — Per-player/NPC game entity
-// ═══════════════════════════════════════════════════════════════════════════
-
-// OS Concept: Entity state management — each character is a schedulable unit.
-// Fields are plain-old-data (POD) for safe cross-process access.
+// per-character state (player or npc)
 struct CharacterState {
-    int alive;                  // 1 = alive, 0 = dead
-    int id;                     // Character index within team
-    TeamType team;              // TEAM_PLAYER or TEAM_NPC
-    int hp;                     // Current health points
-    int max_hp;                 // Maximum health points
-    int dmg;                    // Base damage per strike
-    int speed;                  // Stamina regeneration rate (per second)
-    int stamina;                // Current stamina (action requires >= max_stamina)
-    int max_stamina;            // Stamina needed to take a turn
-    int stunned_until_epoch;     // Unix timestamp when stun expires (in-game stun)
-    int inventory[INVENTORY_SLOTS]; // Contiguous weapon slots (0 = empty, W_ID = weapon)
-    int storage[MAX_STORAGE];    // Stored weapons (for SWAP_IN action)
-    int storage_count;           // Number of weapons in storage
+    int alive;
+    int id;
+    TeamType team;
+    int hp;
+    int max_hp;
+    int dmg;
+    int speed;                  // stamina regen rate per second
+    int stamina;
+    int max_stamina;
+    int stunned_until_epoch;    // unix time when stun expires
+    int ready_epoch;            // unix time when stamina first became full (for FCFS scheduling)
+    int inventory[INVENTORY_SLOTS]; // contiguous weapon slots (0=empty)
+    int storage[MAX_STORAGE];   // long-term storage
+    int storage_count;
 };
 
-// ═══════════════════════════════════════════════════════════════════════════
-// ARTIFACT STATE — Shared resource with waiting queue
-// ═══════════════════════════════════════════════════════════════════════════
-
-// OS Concept: Shared resource with lock acquisition queue.
-// Implements a simple spin-like queue for artifact waiters.
+// artifact state - tracks who holds each global artifact
 struct ArtifactState {
-    WeaponId id;                // Which artifact (Solar Core, Lunar Blade, Eclipse Relic)
-    int present;                // 1 if spawned, 0 if hidden (Eclipse Relic only)
-    int holder_team;            // TEAM_PLAYER or TEAM_NPC, -1 if free
-    int holder_id;              // Character index holding the artifact, -1 if free
-    int waiting_count;          // Number of characters waiting for this artifact
-    int waiters_team[MAX_WAITING]; // Team of each waiting character
-    int waiters_id[MAX_WAITING];   // ID of each waiting character
+    WeaponId id;
+    int present;            // 1 if spawned (eclipse relic starts at 0)
+    int holder_team;        // -1 if free
+    int holder_id;          // -1 if free
+    int waiting_count;      // characters waiting for this artifact
+    int waiters_team[MAX_WAITING];
+    int waiters_id[MAX_WAITING];
 };
 
-// ═══════════════════════════════════════════════════════════════════════════
-// PENDING ACTION — In-flight action from HIP/ASP to Arbiter
-// ═══════════════════════════════════════════════════════════════════════════
-
-// OS Concept: Inter-process communication message — producer-consumer pattern.
-// HIP/ASP write this, Arbiter reads it. ready flag gates the consumer.
+// action submitted by hip/asp, arbiter picks it up when ready==1
 struct PendingAction {
-    int ready;              // 1 = valid action pending, 0 = no action
-    ActionType action;      // Which action to perform
-    int actor_team;         // Team of the acting character
-    int actor_id;           // ID of the acting character
-    int target_team;        // Team of the target character
-    int target_id;          // ID of the target character
-    WeaponId weapon;        // Which weapon to use (for ACT_USE_WEAPON)
+    int ready;
+    ActionType action;
+    int actor_team;
+    int actor_id;
+    int target_team;
+    int target_id;
+    WeaponId weapon;
 };
 
-// ═══════════════════════════════════════════════════════════════════════════
-// SHARED STATE — Root structure mapped into all processes' address spaces
-// ═══════════════════════════════════════════════════════════════════════════
-//
-// OS Concepts:
-//   - SHARED MEMORY IPC: This entire struct is memory-mapped via shm_open/mmap
-//     and visible to arbiter, hip, and asp processes simultaneously.
-//   - SYNCHRONIZATION: mtx, turn_cv, action_cv are process-shared primitives.
-//     They protect ALL fields below for safe concurrent access.
-//   - CONDITION VARIABLES: turn_cv signals stamina changes / turn assignments.
-//     action_cv signals when HIP/ASP has submitted a pending action.
-
+// main shared state struct - mapped into all processes
 struct SharedState {
-    // Synchronization primitives (OS Concept: Process-shared mutex/condvar)
-    pthread_mutex_t mtx;       // Protects all fields below
-    pthread_cond_t turn_cv;    // Signals: stamina updated, turn changed
-    pthread_cond_t action_cv;   // Signals: pending action ready
+    // synchronization (process-shared mutex and condvars)
+    pthread_mutex_t mtx;
+    pthread_cond_t turn_cv;     // signals stamina updates and turn changes
+    pthread_cond_t action_cv;   // signals when hip/asp submits an action
 
-    // Initialization flag — HIP/ASP threads spin on this until arbiter is ready
-    int initialized;
+    // semaphores for syncing actions between processes
+    sem_t action_sem;   // posted when a new action is ready (hip/asp -> arbiter)
+    sem_t turn_sem;     // posted when stamina is replenished
+    sem_t log_sem;      // binary semaphore for thread-safe log writes
 
-    // Game state
-    int running;               // 1 = game active, 0 = game over
-    int roll_seed;             // Seed for RNG (deterministic game generation)
+    int initialized;            // hip/asp wait on this before starting
 
-    // Character counts
-    int num_players;           // Party size (1-4)
-    int num_npcs;              // Number of NPC enemies (2-9, derived from roll)
+    // scheduling configuration
+    SchedulerMode scheduler_mode;   // current scheduling mode
+    int quantum_ms;                  // round-robin quantum in milliseconds
 
-    // Character arrays — these are the primary data structures
-    // OS Concept: Process isolation — each process sees the same arrays
+    // deadlock configuration
+    DeadlockStrategy deadlock_strategy; // active deadlock prevention strategy
+
+    // game state
+    int running;
+    int roll_seed;
+
+    // character arrays
+    int num_players;
+    int num_npcs;
     CharacterState players[MAX_PLAYERS];
     CharacterState npcs[MAX_NPCS];
 
-    // Current turn assignment — which character is active
-    int active_team;           // TEAM_PLAYER or TEAM_NPC
-    int active_id;             // Character index within team
-    int turn_seq;              // Turn counter (increments each turn)
+    // current turn - who's active right now
+    int active_team;
+    int active_id;
+    int turn_seq;
 
-    // Pending action from HIP/ASP — producer-consumer pattern
+    // pending action from hip/asp
     PendingAction pending;
 
-    // Artifacts — shared resources with potential for deadlock
-    ArtifactState artifacts[3]; // Solar Core, Lunar Blade, Eclipse Relic
-    int eclipse_present;       // 0 = hidden, 1 = spawned
+    // artifacts (solar core, lunar blade, eclipse relic)
+    ArtifactState artifacts[3];
+    int eclipse_present;
 
-    // Win/lose tracking
-    int kills;                 // NPC kills by player team (win at 10)
-    int win;                   // 1 = victory, 0 = defeat
+    // alternating turn order: 0 = player's turn to act, 1 = NPC's turn to act
+    int turn_order;
 
-    // Circular log buffer — recent game events
-    int log_head;              // Index of next write position
+    // currently selected player in the UI cage (written by Visualizer, read by arbiter for targeting)
+    int selected_player_id;
+
+    // win/lose tracking
+    int kills;                  // player team kills (win at 10)
+    int win;
+
+    // circular log buffer for the UI
+    int log_head;
     char logs[MAX_LOG][MAX_LOG_LEN];
 
-    // Process IDs — used for inter-process signal delivery
-    // OS Concept: Signal delivery across processes (kill(pid, SIGUSR1))
-    pid_t arbiter_pid;         // For HIP/ASP to send signals
+    // process pids for signal delivery between processes
+    pid_t arbiter_pid;
     pid_t hip_pid;
     pid_t asp_pid;
 };

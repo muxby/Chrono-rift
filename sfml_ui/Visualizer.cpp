@@ -1,48 +1,135 @@
 #include "Visualizer.hpp"
-#include <sstream>
+#include "os_helpers.hpp"
+#include <cstdio>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <cmath>
+#include <algorithm>
+#include <fstream>
+
+using namespace std;
+
+#include <unistd.h>
+#include <limits.h>
+
+static std::string resolvePath(const std::string& path) {
+    std::cerr << "[PATH] Resolving: " << path << std::endl;
+
+    // 1. Try relative to the current working directory first
+    {
+        std::ifstream f(path.c_str());
+        if (f.good()) {
+            std::cerr << "  -> Found in CWD: " << path << std::endl;
+            return path;
+        }
+    }
+
+    // 2. Try relative to the directory of the running executable (handles VM, Docker, custom script locations)
+    char exePath[PATH_MAX];
+    ssize_t len = readlink("/proc/self/exe", exePath, sizeof(exePath) - 1);
+    if (len != -1) {
+        exePath[len] = '\0';
+        std::string exeDir = exePath;
+        size_t lastSlash = exeDir.find_last_of('/');
+        if (lastSlash != std::string::npos) {
+            exeDir = exeDir.substr(0, lastSlash);
+        }
+        std::cerr << "  -> Executable Dir: " << exeDir << std::endl;
+
+        // Try directly inside executable directory
+        std::string try1 = exeDir + "/" + path;
+        {
+            std::ifstream f(try1.c_str());
+            if (f.good()) {
+                std::cerr << "  -> Found in Exe Dir: " << try1 << std::endl;
+                return try1;
+            }
+        }
+
+        // Try in the parent directory of the executable (common when running from inside sfml_ui/)
+        std::string try2 = exeDir + "/../" + path;
+        {
+            std::ifstream f(try2.c_str());
+            if (f.good()) {
+                std::cerr << "  -> Found in Parent of Exe: " << try2 << std::endl;
+                return try2;
+            }
+        }
+    } else {
+        std::cerr << "  -> readlink() failed to get executable path!" << std::endl;
+    }
+
+    // 3. Fallback to default relative path
+    std::cerr << "  -> Fallback to default path: " << path << std::endl;
+    return path;
+}
 
 namespace ChronoRift {
 
-// ═══════════════════════════════════════════════════════════════════════════
-// CONSTRUCTOR / DESTRUCTOR
-// ═══════════════════════════════════════════════════════════════════════════
+// constructor / destructor
+
+// ── Fighter name tables ──────────────────────────────────────────────────
+static const char* PLAYER_NAMES[4] = {"KHABIB", "KHAMZAT", "ILLIA", "JUSTIN"};
+static const char* ENEMY_NAMES[4]  = {"McGREGOR", "ALEX P.", "JON JONES", "PADDY"};
 
 Visualizer::Visualizer()
     : window(sf::VideoMode(static_cast<unsigned>(WINDOW_WIDTH),
                            static_cast<unsigned>(WINDOW_HEIGHT)),
-             "Chrono Rift — OS Process Visualizer", sf::Style::Close),
-      running(false), sharedState(nullptr), currentMode(ViewMode::HYBRID),
+             "Chrono Rift - OS Process Visualizer", sf::Style::Close),
+      running(false), sharedState(nullptr), currentMode(ViewMode::COMBAT),
+      isIntroActive(true), introFrameIndex(0), introFrameTimer(0.f),
+      playerCardCount(0), npcCardCount(0), arbiterNode(nullptr),
+      processBlockCount(0), hipSlotCount(0), buttonCount(0), sliderCount(0),
+      schedulingBtns{nullptr,nullptr,nullptr,nullptr},
+      deadlockBtns{nullptr,nullptr,nullptr},
+      playerInCage(0), enemyInCage(0), bannersLoaded(false),
+      bgFrameIndex(0), bgFrameTimer(0.f),
       simulationTime(0.f), avgWaitingTime(0.f), avgTurnaroundTime(0.f),
       cpuThroughput(0.f), totalProcessesSpawned(0), lastTurnSeq(0), lastKills(0),
-      quantumTime(2.0f), schedulingPriority(5) {}
+      quantumTime(2.0f), schedulingPriority(5),
+      localTurnOrder(0)
+{
+    memset(lastHPPlayers, 0, sizeof(lastHPPlayers));
+    memset(lastHPNpcs, 0, sizeof(lastHPNpcs));
+}
 
 Visualizer::~Visualizer() {
     shutdown();
+
+    for (int i = 0; i < playerCardCount; ++i) delete playerCards[i];
+    for (int i = 0; i < npcCardCount; ++i) delete npcCards[i];
+    for (int i = 0; i < 3; ++i) delete artifactDisplays[i];
+    delete arbiterNode;
+    for (int i = 0; i < processBlockCount; ++i) delete processBlocks[i];
+    for (int i = 0; i < hipSlotCount; ++i) delete hipSlots[i];
+    for (int i = 0; i < buttonCount; ++i) delete buttons[i];
+    for (int i = 0; i < 4; ++i) delete schedulingBtns[i];
+    for (int i = 0; i < 3; ++i) delete deadlockBtns[i];
+    for (int i = 0; i < sliderCount; ++i) delete sliders[i];
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// INITIALIZATION
-// ═══════════════════════════════════════════════════════════════════════════
+// init
 
 bool Visualizer::initialize() {
-    window.setFramerateLimit(60);
-    window.setVerticalSyncEnabled(true);
+    window.setFramerateLimit(30);
+    window.setVerticalSyncEnabled(true); // enabled vsync
 
     if (!loadFonts()) {
-        std::cerr << "Failed to load fonts!" << std::endl;
+        cerr << "Failed to load fonts!" << endl;
         return false;
     }
 
+    loadBackgroundFrames();
+    loadIntroFrames();
+    loadFighterSprites();
+    loadBannerImages();
     initComponents();
     running = true;
     return true;
 }
 
 bool Visualizer::loadFonts() {
-    // Try multiple system font locations
     const char* fontPaths[] = {
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -53,10 +140,8 @@ bool Visualizer::loadFonts() {
         "/usr/share/fonts/TTF/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
         "/usr/share/fonts/truetype/droid/DroidSans.ttf",
-        // macOS paths
         "/Library/Fonts/Arial.ttf",
         "/System/Library/Fonts/Helvetica.ttc",
-        // Windows paths (for WSL/cross-platform)
         "/mnt/c/Windows/Fonts/arial.ttf",
         "/mnt/c/Windows/Fonts/segoeui.ttf",
     };
@@ -70,12 +155,10 @@ bool Visualizer::loadFonts() {
     }
 
     if (!loaded) {
-        std::cerr << "WARNING: Could not load font. Text rendering will fail." << std::endl;
-        // Create a minimal fallback
+        cerr << "WARNING: Could not load font. Text rendering will fail." << endl;
         return false;
     }
 
-    // Try to load monospace font for metrics
     const char* monoPaths[] = {
         "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
@@ -89,10 +172,122 @@ bool Visualizer::loadFonts() {
         }
     }
     if (monoFont.getInfo().family.empty()) {
-        monoFont = mainFont; // fallback
+        monoFont = mainFont;
     }
 
     return true;
+}
+
+// ── Background image-sequence loader ────────────────────────────────────────
+void Visualizer::loadBackgroundFrames() {
+    // Frames are at  background/frame_XXXX.jpg  relative to the working dir.
+    // We load up to 9999 frames, stopping at the first missing file.
+    char path[256];
+    for (int i = 0; i < 9999; ++i) {
+        snprintf(path, sizeof(path), "background/frame_%04d.jpg", i);
+        sf::Texture tex;
+        tex.setSmooth(true);
+        if (!tex.loadFromFile(resolvePath(path))) break;  // stop at first missing frame
+        bgFrames.push_back(std::move(tex));
+    }
+
+    if (bgFrames.empty()) {
+        cerr << "WARNING: No background frames found in background/ folder." << endl;
+        return;
+    }
+
+    cerr << "[BG] Loaded " << bgFrames.size() << " background frames." << endl;
+
+    // Initialise the sprite to the first frame and scale to fill the window
+    bgSprite.setTexture(bgFrames[0]);
+    sf::Vector2u texSz = bgFrames[0].getSize();
+    if (texSz.x > 0 && texSz.y > 0) {
+        bgSprite.setScale(
+            WINDOW_WIDTH  / static_cast<float>(texSz.x),
+            WINDOW_HEIGHT / static_cast<float>(texSz.y));
+    }
+}
+
+// ── Intro image-sequence loader ────────────────────────────────────────────
+void Visualizer::loadIntroFrames() {
+    char path[256];
+    for (int i = 0; i < 9999; ++i) {
+        snprintf(path, sizeof(path), "intro_frames/frame_%04d.jpg", i);
+        sf::Texture tex;
+        tex.setSmooth(true);
+        if (!tex.loadFromFile(resolvePath(path))) break;
+        introFrames.push_back(std::move(tex));
+    }
+
+    if (!introFrames.empty()) {
+        cerr << "[INTRO] Loaded " << introFrames.size() << " intro frames." << endl;
+        introSprite.setTexture(introFrames[0]);
+        sf::Vector2u texSz = introFrames[0].getSize();
+        if (texSz.x > 0 && texSz.y > 0) {
+            introSprite.setScale(
+                WINDOW_WIDTH  / static_cast<float>(texSz.x),
+                WINDOW_HEIGHT / static_cast<float>(texSz.y));
+        }
+    } else {
+        isIntroActive = false; // Disable if no frames
+        cerr << "WARNING: No intro frames found." << endl;
+    }
+}
+
+// ── Load all fighter spritesheets ────────────────────────────────────────
+void Visualizer::loadFighterSprites() {
+    // Players: standing + attack
+    playerFighters[0].loadStanding(resolvePath("SPRITESHEET/Players/player_standing_sprites/khabib_standing.png"));
+    playerFighters[0].loadAttack(resolvePath("SPRITESHEET/Players/player_attack/khabib_attack.png"));
+
+    playerFighters[1].loadStanding(resolvePath("SPRITESHEET/Players/player_standing_sprites/khamzat_standing.png"));
+    playerFighters[1].loadAttack(resolvePath("SPRITESHEET/Players/player_attack/khamzat_attack_sprite.png"));
+
+    playerFighters[2].loadStanding(resolvePath("SPRITESHEET/Players/player_standing_sprites/illia toporia_standing.png"));
+    playerFighters[2].loadAttack(resolvePath("SPRITESHEET/Players/player_attack/illia_attack.png"));
+
+    playerFighters[3].loadStanding(resolvePath("SPRITESHEET/Players/player_standing_sprites/justin gagje_standing.png"));
+    playerFighters[3].loadAttack(resolvePath("SPRITESHEET/Players/player_attack/justin_attack.png"));
+
+    // Enemies: standing + attack
+    enemyFighters[0].loadStanding(resolvePath("SPRITESHEET/enemy/enemy standing/mcgregor_static.png"));
+    enemyFighters[0].loadAttack(resolvePath("SPRITESHEET/enemy/enemy_attack/mcgregor_attack.png"));
+
+    enemyFighters[1].loadStanding(resolvePath("SPRITESHEET/enemy/enemy standing/alex_preira_static.png"));
+    enemyFighters[1].loadAttack(resolvePath("SPRITESHEET/enemy/enemy_attack/alex_attack.png"));
+
+    enemyFighters[2].loadStanding(resolvePath("SPRITESHEET/enemy/enemy standing/john_jones_static.png"));
+    enemyFighters[2].loadAttack(resolvePath("SPRITESHEET/enemy/enemy_attack/john_jones_attack.png"));
+
+    enemyFighters[3].loadStanding(resolvePath("SPRITESHEET/enemy/enemy standing/paddy pimblett_static.png"));
+    enemyFighters[3].loadAttack(resolvePath("SPRITESHEET/enemy/enemy_attack/paddy_attack.png"));
+
+    // Set animation FPS for all fighters — 10 FPS for normal animations
+    for (int i = 0; i < MAX_PLAYERS; ++i) playerFighters[i].setFPS(10.f);
+    for (int i = 0; i < 4; ++i) enemyFighters[i].setFPS(10.f);
+
+    cerr << "[FIGHTERS] All fighter spritesheets loaded." << endl;
+}
+
+// ── Load optional banner portrait images ─────────────────────────────────
+void Visualizer::loadBannerImages() {
+    const char* bannerPaths[8] = {
+        "SPRITESHEET/banners/khabib_banner.png",
+        "SPRITESHEET/banners/khamzat_banner.png",
+        "SPRITESHEET/banners/illia_banner.png",
+        "SPRITESHEET/banners/justin_banner.png",
+        "SPRITESHEET/banners/mcgregor_banner.png",
+        "SPRITESHEET/banners/alex_banner.png",
+        "SPRITESHEET/banners/jones_banner.png",
+        "SPRITESHEET/banners/paddy_banner.png"
+    };
+    bannersLoaded = true;
+    for (int i = 0; i < 8; ++i) {
+        if (!bannerTextures[i].loadFromFile(resolvePath(bannerPaths[i]))) {
+            bannersLoaded = false;  // will fall back to spritesheet portraits
+        }
+    }
+    cerr << "[BANNERS] Banner images " << (bannersLoaded ? "loaded" : "not found, using sprite portraits") << endl;
 }
 
 void Visualizer::initComponents() {
@@ -102,145 +297,181 @@ void Visualizer::initComponents() {
     initControls();
     initSchedulerView();
 
-    // Log panel
-    logPanel = std::make_unique<LogPanel>(
-        20.f, WINDOW_HEIGHT - FOOTER_HEIGHT + 10.f,
-        LEFT_PANEL_WIDTH - 40.f, FOOTER_HEIGHT - 40.f, mainFont);
-
-    // Metrics dashboard
-    metricsDashboard = std::make_unique<MetricsDashboard>(
-        WINDOW_WIDTH - RIGHT_PANEL_WIDTH + 20.f, 80.f,
-        RIGHT_PANEL_WIDTH - 40.f, mainFont);
-
-    // Gantt chart
-    ganttChart = std::make_unique<GanttChart>(
-        LEFT_PANEL_WIDTH + 20.f, WINDOW_HEIGHT - FOOTER_HEIGHT + 20.f,
-        WINDOW_WIDTH - LEFT_PANEL_WIDTH - RIGHT_PANEL_WIDTH - 40.f,
-        FOOTER_HEIGHT - 60.f, mainFont);
-
-    // Arbiter node (center top)
-    arbiterNode = std::make_unique<ArbiterNode>(
-        WINDOW_WIDTH / 2.f, HEADER_HEIGHT + 60.f, 40.f, mainFont);
-
-    // Connection lines from arbiter to panels
-    connectionLines.resize(4);
+    // Arbiter node: centered in the header bar
+    arbiterNode = new ArbiterNode(
+        WINDOW_WIDTH / 2.f, HEADER_HEIGHT / 2.f + 5.f, 26.f, mainFont);
 }
 
 void Visualizer::initPlayerCards() {
-    float cardW = (WINDOW_WIDTH - LEFT_PANEL_WIDTH - RIGHT_PANEL_WIDTH - 60.f) / 2.f;
-    float cardH = 85.f;
-    float startX = LEFT_PANEL_WIDTH + 20.f;
-    float startY = HEADER_HEIGHT + 130.f;
+    // Left panel: 4 player cards stacked vertically
+    float cardW = LEFT_PANEL_WIDTH - 20.f;  // 260px
+    float cardH = 72.f;
+    float startX = 10.f;
+    float startY = HEADER_HEIGHT + 26.f;    // below section label
+    float gap    = 6.f;
 
     for (int i = 0; i < MAX_PLAYERS; ++i) {
-        auto card = std::make_unique<CharacterCard>(
-            startX, startY + i * (cardH + 8.f), cardW, cardH, mainFont, true);
-        playerCards.push_back(std::move(card));
+        playerCards[playerCardCount++] = new CharacterCard(
+            startX, startY + i * (cardH + gap), cardW, cardH, mainFont, true);
     }
 }
 
 void Visualizer::initNpcCards() {
-    float cardW = (WINDOW_WIDTH - LEFT_PANEL_WIDTH - RIGHT_PANEL_WIDTH - 60.f) / 2.f;
-    float cardH = 85.f;
-    float startX = LEFT_PANEL_WIDTH + cardW + 40.f;
-    float startY = HEADER_HEIGHT + 130.f;
+    // Center area: NPC cards in dynamic columns based on count
+    // Use 2 columns minimum, add more if needed to prevent overlap
+    float centerW = WINDOW_WIDTH - LEFT_PANEL_WIDTH - RIGHT_PANEL_WIDTH; // 1040
+    float cardH   = 62.f;
+    float startX  = LEFT_PANEL_WIDTH + 10.f;
+    float startY  = HEADER_HEIGHT + 26.f;      // below section label
+    float gap     = 5.f;
+
+    // Calculate columns needed: max 5 per column
+    int maxPerCol = 5;
+    int numCols = (MAX_NPCS + maxPerCol - 1) / maxPerCol;  // ceil division
+    numCols = cr_max(2, numCols);  // At least 2 columns
+    float colW = (centerW - (numCols + 1) * 10.f) / numCols;
 
     for (int i = 0; i < MAX_NPCS; ++i) {
-        auto card = std::make_unique<CharacterCard>(
-            startX, startY + i * (cardH + 8.f), cardW, cardH, mainFont, false);
-        npcCards.push_back(std::move(card));
+        int col = i / maxPerCol;
+        int row = i % maxPerCol;
+        float cx = startX + col * (colW + 10.f);
+        float cy = startY + row * (cardH + gap);
+        npcCards[npcCardCount++] = new CharacterCard(
+            cx, cy, colW, cardH, mainFont, false);
     }
 }
 
 void Visualizer::initArtifacts() {
-    float artW = (WINDOW_WIDTH - LEFT_PANEL_WIDTH - RIGHT_PANEL_WIDTH - 80.f) / 3.f;
-    float startX = LEFT_PANEL_WIDTH + 20.f;
-    float startY = HEADER_HEIGHT + 500.f;
+    // Artifacts: row just above the footer in the center area
+    float centerW = WINDOW_WIDTH - LEFT_PANEL_WIDTH - RIGHT_PANEL_WIDTH;
+    float artW    = (centerW - 40.f) / 3.f;
+    float startX  = LEFT_PANEL_WIDTH + 10.f;
+    float startY  = WINDOW_HEIGHT - FOOTER_HEIGHT - 58.f;
 
     for (int i = 0; i < 3; ++i) {
-        auto art = std::make_unique<ArtifactDisplay>(
+        artifactDisplays[i] = new ArtifactDisplay(
             startX + i * (artW + 10.f), startY, artW, mainFont);
-        artifactDisplays.push_back(std::move(art));
     }
+}
+
+void Visualizer::onSpawnProcess(void* ctx) {
+    // Particles disabled - plain UI
+    static_cast<Visualizer*>(ctx)->spawnNewProcess();
+}
+
+void Visualizer::onSwitchCombat(void* ctx) {
+    static_cast<Visualizer*>(ctx)->switchMode(ViewMode::COMBAT);
+}
+
+// Tag-based callback for scheduling mode buttons (0=STAMINA, 1=RR, 2=FIFO, 3=PRIO)
+void Visualizer::onSchedMode(void* ctx, int mode) {
+    auto* vis = static_cast<Visualizer*>(ctx);
+    if (vis->sharedState) vis->sharedState->scheduler_mode = static_cast<SchedulerMode>(mode);
+}
+
+// Tag-based callback for deadlock strategy buttons (0=DETECT, 1=NO_HOLD, 2=PREEMPT)
+void Visualizer::onDeadlockStrategy(void* ctx, int strategy) {
+    auto* vis = static_cast<Visualizer*>(ctx);
+    if (vis->sharedState) vis->sharedState->deadlock_strategy = static_cast<DeadlockStrategy>(strategy);
 }
 
 void Visualizer::initControls() {
-    float btnX = WINDOW_WIDTH - RIGHT_PANEL_WIDTH + 30.f;
-    float btnY = 240.f;
+    // Right panel controls: below MetricsDashboard (starts at y=HEADER+8, height=140)
+    float btnX = WINDOW_WIDTH - RIGHT_PANEL_WIDTH + 10.f;
+    float btnY = HEADER_HEIGHT + 160.f;  // 70+8+140+12 margin
 
-    // Spawn Process button
-    auto spawnBtn = std::make_unique<Button>(
-        btnX, btnY, 130.f, 36.f, "+ PROCESS", mainFont, FONT_SMALL);
-    spawnBtn->setColors(NEON_GREEN, sf::Color(100, 255, 100, 255), sf::Color::Black);
-    spawnBtn->setCallback([this]() { spawnNewProcess(); });
-    buttons.push_back(std::move(spawnBtn));
+    Button* spawnBtn = new Button(
+        btnX, btnY, 120.f, 30.f, "+ PROCESS", mainFont, FONT_SMALL);
+    spawnBtn->setColors(sf::Color(220, 220, 220), sf::Color(200, 200, 200), TEXT_PRIMARY);
+    spawnBtn->setCallback(&Visualizer::onSpawnProcess, this);
+    buttons[buttonCount++] = spawnBtn;
 
-    // Mode switch buttons
-    auto combatBtn = std::make_unique<Button>(
-        btnX + 140.f, btnY, 80.f, 36.f, "COMBAT", mainFont, FONT_SMALL);
-    combatBtn->setColors(NEON_BLUE, NEON_CYAN, sf::Color::White);
-    combatBtn->setCallback([this]() { switchMode(ViewMode::COMBAT); });
-    buttons.push_back(std::move(combatBtn));
+    Button* combatBtn = new Button(
+        btnX + 128.f, btnY, 80.f, 30.f, "COMBAT", mainFont, FONT_SMALL);
+    combatBtn->setColors(sf::Color(220, 220, 220), sf::Color(200, 200, 200), TEXT_PRIMARY);
+    combatBtn->setCallback(&Visualizer::onSwitchCombat, this);
+    buttons[buttonCount++] = combatBtn;
 
-    // Quantum slider
-    auto qSlider = std::make_unique<Slider>(
-        btnX, btnY + 55.f, 200.f, 0.5f, 10.f, quantumTime,
-        "Quantum Time (s)", mainFont);
-    sliders.push_back(std::move(qSlider));
+    Slider* qSlider = new Slider(
+        btnX, btnY + 42.f, RIGHT_PANEL_WIDTH - 20.f, 0.5f, 10.f, quantumTime,
+        "Quantum (s)", mainFont);
+    sliders[sliderCount++] = qSlider;
 
-    // Priority slider
-    auto pSlider = std::make_unique<Slider>(
-        btnX, btnY + 105.f, 200.f, 1.f, 10.f, static_cast<float>(schedulingPriority),
-        "Priority Level", mainFont);
-    sliders.push_back(std::move(pSlider));
+    Slider* pSlider = new Slider(
+        btnX, btnY + 92.f, RIGHT_PANEL_WIDTH - 20.f, 1.f, 10.f,
+        static_cast<float>(schedulingPriority), "Priority", mainFont);
+    sliders[sliderCount++] = pSlider;
+
+    // -- Scheduling Mode Buttons (row of 4) --
+    const char* schedLabels[4] = {"STAM", "RR", "FIFO", "PRIO"};
+    float sbW = (RIGHT_PANEL_WIDTH - 20.f) / 4.f - 2.f;
+    for (int i = 0; i < 4; ++i) {
+        Button* sb = new Button(
+            btnX + i * (sbW + 2.f), btnY + 136.f, sbW, 22.f,
+            schedLabels[i], mainFont, FONT_TINY);
+        sb->setColors(sf::Color(220, 220, 220), sf::Color(200, 200, 200), TEXT_PRIMARY);
+        sb->setCallbackWithTag(&Visualizer::onSchedMode, this, i);
+        schedulingBtns[i] = sb;
+    }
+
+    // -- Deadlock Strategy Buttons (row of 3) --
+    const char* dlLabels[3] = {"DETECT", "NO_HLD", "PRMT"};
+    float dbW = (RIGHT_PANEL_WIDTH - 20.f) / 3.f - 2.f;
+    for (int i = 0; i < 3; ++i) {
+        Button* db = new Button(
+            btnX + i * (dbW + 2.f), btnY + 162.f, dbW, 22.f,
+            dlLabels[i], mainFont, FONT_TINY);
+        db->setColors(sf::Color(220, 220, 220), sf::Color(200, 200, 200), TEXT_PRIMARY);
+        db->setCallbackWithTag(&Visualizer::onDeadlockStrategy, this, i);
+        deadlockBtns[i] = db;
+    }
 }
 
 void Visualizer::initSchedulerView() {
-    // ASP Process blocks (left side)
-    float blockW = LEFT_PANEL_WIDTH - 40.f;
-    float blockH = 50.f;
-    float startX = 20.f;
-    float startY = HEADER_HEIGHT + 80.f;
+    // Deferred: actual counts set in run() once sharedState is known.
+    // Create placeholder blocks (max possible = MAX_PLAYERS + MAX_NPCS = 13)
+    float blockW = LEFT_PANEL_WIDTH - 20.f;
+    float blockH = 46.f;
+    float startX = 10.f;
+    float startY = HEADER_HEIGHT + 26.f;
 
-    for (int i = 0; i < 6; ++i) {
-        auto block = std::make_unique<ProcessBlock>(
-            startX, startY + i * (blockH + 8.f), blockW, blockH, i + 100, mainFont);
-        processBlocks.push_back(std::move(block));
+    int total = MAX_PLAYERS + MAX_NPCS;
+    for (int i = 0; i < total; ++i) {
+        processBlocks[processBlockCount++] = new ProcessBlock(
+            startX, startY + i * (blockH + 6.f), blockW, blockH, i + 100, mainFont);
     }
 
-    // HIP CPU slots (right side)
-    float slotW = RIGHT_PANEL_WIDTH - 40.f;
-    float slotH = 55.f;
-    float slotX = WINDOW_WIDTH - RIGHT_PANEL_WIDTH + 20.f;
-    float slotY = 420.f;
+    // Right panel: 4 CPU/HIP slots
+    float slotW = RIGHT_PANEL_WIDTH - 20.f;
+    float slotH = 50.f;
+    float slotX = WINDOW_WIDTH - RIGHT_PANEL_WIDTH + 10.f;
+    float slotY = HEADER_HEIGHT + 360.f;
 
-    for (int i = 0; i < 4; ++i) {
-        auto slot = std::make_unique<HIPSlot>(
-            slotX, slotY + i * (slotH + 8.f), slotW, slotH, i, "Core", mainFont);
-        hipSlots.push_back(std::move(slot));
+    for (int i = 0; i < MAX_PLAYERS; ++i) {
+        hipSlots[hipSlotCount++] = new HIPSlot(
+            slotX, slotY + i * (slotH + 6.f), slotW, slotH, i, "Core", mainFont);
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// MAIN LOOP
-// ═══════════════════════════════════════════════════════════════════════════
+// main loop
 
 void Visualizer::run(SharedState* state) {
     sharedState = state;
     gameClock.restart();
+    deltaClock.restart();  // reset so init time doesn't bleed into first frame dt
 
     while (running && window.isOpen()) {
         float dt = deltaClock.restart().asSeconds();
+        if (dt > 0.1f) dt = 0.1f;  // clamp to prevent frame-skipping on first frame
         simulationTime = gameClock.getElapsedTime().asSeconds();
 
         handleEvents();
         update(dt);
         render();
 
-        // Check for game over
         if (sharedState && !sharedState->running) {
+            render();  // one last frame showing final state
             renderGameOver();
-            sf::sleep(sf::seconds(3));
             running = false;
         }
     }
@@ -253,9 +484,7 @@ void Visualizer::shutdown() {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// EVENT HANDLING
-// ═══════════════════════════════════════════════════════════════════════════
+// event handling
 
 void Visualizer::handleEvents() {
     sf::Event event;
@@ -269,23 +498,34 @@ void Visualizer::handleEvents() {
             handleKeyPress(event.key.code);
         }
 
-        // Pass events to UI components
-        for (auto& btn : buttons) {
-            btn->handleEvent(event, window);
+        for (int i = 0; i < buttonCount; ++i) {
+            buttons[i]->handleEvent(event, window);
         }
-        for (auto& slider : sliders) {
-            slider->handleEvent(event, window);
+        for (int i = 0; i < sliderCount; ++i) {
+            sliders[i]->handleEvent(event, window);
+        }
+        for (int i = 0; i < 4; ++i) {
+            if (schedulingBtns[i]) schedulingBtns[i]->handleEvent(event, window);
+        }
+        for (int i = 0; i < 3; ++i) {
+            if (deadlockBtns[i]) deadlockBtns[i]->handleEvent(event, window);
         }
 
+        // Mouse click - no particle effects (plain white UI)
         if (event.type == sf::Event::MouseButtonPressed &&
             event.mouseButton.button == sf::Mouse::Left) {
-            handleMouseClick(event.mouseButton.x, event.mouseButton.y);
+            // No-op: no particle effects in plain UI
         }
     }
 }
 
 void Visualizer::handleKeyPress(sf::Keyboard::Key key) {
+    if (isIntroActive) {
+        isIntroActive = false;
+        return;
+    }
     switch (key) {
+        // ── View Mode Switching ──────────────────────────────────────────
         case sf::Keyboard::Num1:
             switchMode(ViewMode::COMBAT);
             break;
@@ -301,121 +541,360 @@ void Visualizer::handleKeyPress(sf::Keyboard::Key key) {
         case sf::Keyboard::Escape:
             running = false;
             break;
+
+        // ── Player Character Switching (W/S/A/D) ────────────────────────
+        // W = previous player, S = next player, A = player -1, D = player +1
+        case sf::Keyboard::W:
+        case sf::Keyboard::A:
+            playerInCage = nextAlivePlayer(playerInCage, -1);
+            if (sharedState) {
+                pthread_mutex_lock(&sharedState->mtx);
+                if (sharedState->active_team == TEAM_PLAYER)
+                    sharedState->active_id = playerInCage;
+                // Always update target so enemy attacks hit the selected player
+                sharedState->selected_player_id = playerInCage;
+                pthread_mutex_unlock(&sharedState->mtx);
+            }
+            break;
+        case sf::Keyboard::S:
+        case sf::Keyboard::D:
+            playerInCage = nextAlivePlayer(playerInCage, +1);
+            if (sharedState) {
+                pthread_mutex_lock(&sharedState->mtx);
+                if (sharedState->active_team == TEAM_PLAYER)
+                    sharedState->active_id = playerInCage;
+                // Always update target so enemy attacks hit the selected player
+                sharedState->selected_player_id = playerInCage;
+                pthread_mutex_unlock(&sharedState->mtx);
+            }
+            break;
+
+        // ── Enemy Character Switching (J/K/L/I) ─────────────────────────
+        // J = prev enemy, I = prev enemy (up), L = next enemy, K = next enemy (down)
+        case sf::Keyboard::J:
+        case sf::Keyboard::I:
+            enemyInCage = nextAliveEnemy(enemyInCage, -1);
+            if (sharedState) {
+                pthread_mutex_lock(&sharedState->mtx);
+                if (sharedState->active_team == TEAM_NPC)
+                    sharedState->active_id = enemyInCage;
+                pthread_mutex_unlock(&sharedState->mtx);
+            }
+            break;
+        case sf::Keyboard::L:
+        case sf::Keyboard::K:
+            enemyInCage = nextAliveEnemy(enemyInCage, +1);
+            if (sharedState) {
+                pthread_mutex_lock(&sharedState->mtx);
+                if (sharedState->active_team == TEAM_NPC)
+                    sharedState->active_id = enemyInCage;
+                pthread_mutex_unlock(&sharedState->mtx);
+            }
+            break;
+
+        // ── Attack Keys — Q/E = player attacks, U/O = enemy attacks ───────────
+        case sf::Keyboard::Q:
+            submitPlayerAttack(ACT_STRIKE);
+            break;
+        case sf::Keyboard::E:
+            submitPlayerAttack(ACT_EXHAUST);
+            break;
+        case sf::Keyboard::U:
+            submitEnemyAttack(ACT_STRIKE);
+            break;
+        case sf::Keyboard::O:
+            submitEnemyAttack(ACT_EXHAUST);
+            break;
+
         default:
             break;
     }
 }
 
-void Visualizer::handleMouseClick(float x, float y) {
-    // Spawn particles at click location
-    particles.emit(x, y, NEON_CYAN, 8);
+// ── Helper: find next alive player in direction dir (+1/-1) ─────────────
+int Visualizer::nextAlivePlayer(int from, int dir) const {
+    if (!sharedState) return from;
+    int n = sharedState->num_players;
+    if (n <= 0) return from;
+    int idx = from;
+    for (int i = 0; i < n; ++i) {
+        idx = (idx + dir + n) % n;
+        if (sharedState->players[idx].alive)
+            return idx;
+    }
+    return from; // no alive player found, keep current
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// UPDATE
-// ═══════════════════════════════════════════════════════════════════════════
+// ── Helper: find next alive enemy in direction dir (+1/-1) ──────────────
+int Visualizer::nextAliveEnemy(int from, int dir) const {
+    if (!sharedState) return from;
+    int n = sharedState->num_npcs;
+    if (n <= 0) return from;
+    int idx = from;
+    for (int i = 0; i < n; ++i) {
+        idx = (idx + dir + n) % n;
+        if (sharedState->npcs[idx].alive)
+            return idx;
+    }
+    return from; // no alive enemy found, keep current
+}
+
+// ── Submit a player attack to the arbiter via shared memory ─────────────
+void Visualizer::submitPlayerAttack(ActionType act) {
+    if (!sharedState) return;
+
+    pthread_mutex_lock(&sharedState->mtx);
+
+    // Gate: only when it is the player's turn (turn_order==0)
+    // We do NOT require active_id==playerInCage because the user may have
+    // switched fighters; we override active_id below.
+    if (sharedState->turn_order != 0 || sharedState->pending.ready) {
+        pthread_mutex_unlock(&sharedState->mtx);
+        return;
+    }
+
+    // Make sure selected player is alive
+    if (playerInCage < 0 || playerInCage >= sharedState->num_players
+        || !sharedState->players[playerInCage].alive) {
+        pthread_mutex_unlock(&sharedState->mtx);
+        return;
+    }
+    // Make sure target enemy is alive; auto-pick another if not
+    if (enemyInCage < 0 || enemyInCage >= sharedState->num_npcs
+        || !sharedState->npcs[enemyInCage].alive) {
+        enemyInCage = nextAliveEnemy(enemyInCage, +1);
+        if (enemyInCage < 0 || !sharedState->npcs[enemyInCage].alive) {
+            pthread_mutex_unlock(&sharedState->mtx);
+            return;
+        }
+    }
+
+    // Override the scheduler's active_id so the correct fighter acts
+    sharedState->active_team = TEAM_PLAYER;
+    sharedState->active_id   = playerInCage;
+
+    PendingAction pa{};
+    pa.action      = act;
+    pa.actor_team  = TEAM_PLAYER;
+    pa.actor_id    = playerInCage;
+    pa.target_team = TEAM_NPC;
+    pa.target_id   = enemyInCage;
+    pa.ready = 1;
+    sharedState->pending = pa;
+
+    // Flip to enemy's turn
+    sharedState->turn_order = 1;
+    localTurnOrder = 1;
+
+    // Trigger both fighters' attack animations
+    playerFighters[playerInCage].triggerAttack();
+    enemyFighters[enemyInCage].triggerAttack();
+
+    pthread_cond_broadcast(&sharedState->action_cv);
+    pthread_mutex_unlock(&sharedState->mtx);
+}
+
+// ── Submit an enemy attack to the arbiter (user presses U/O) ─────────────
+void Visualizer::submitEnemyAttack(ActionType act) {
+    if (!sharedState) return;
+
+    pthread_mutex_lock(&sharedState->mtx);
+
+    // Gate: only when it is the enemy's turn (turn_order==1)
+    if (sharedState->turn_order != 1 || sharedState->pending.ready) {
+        pthread_mutex_unlock(&sharedState->mtx);
+        return;
+    }
+
+    // Make sure selected enemy is alive; auto-pick another if not
+    if (enemyInCage < 0 || enemyInCage >= sharedState->num_npcs
+        || !sharedState->npcs[enemyInCage].alive) {
+        enemyInCage = nextAliveEnemy(enemyInCage, +1);
+        if (enemyInCage < 0 || !sharedState->npcs[enemyInCage].alive) {
+            pthread_mutex_unlock(&sharedState->mtx);
+            return;
+        }
+    }
+    // Make sure target player is alive; auto-pick another if not
+    if (playerInCage < 0 || playerInCage >= sharedState->num_players
+        || !sharedState->players[playerInCage].alive) {
+        playerInCage = nextAlivePlayer(playerInCage, +1);
+        if (playerInCage < 0 || !sharedState->players[playerInCage].alive) {
+            pthread_mutex_unlock(&sharedState->mtx);
+            return;
+        }
+    }
+
+    // Override the scheduler's active_id so the correct enemy acts
+    sharedState->active_team = TEAM_NPC;
+    sharedState->active_id   = enemyInCage;
+    // Confirm the target is the currently selected/visible player
+    sharedState->selected_player_id = playerInCage;
+
+    PendingAction pa{};
+    pa.action      = act;
+    pa.actor_team  = TEAM_NPC;
+    pa.actor_id    = enemyInCage;
+    pa.target_team = TEAM_PLAYER;
+    pa.target_id   = playerInCage;  // always hits the selected player
+    pa.ready = 1;
+    sharedState->pending = pa;
+
+    // Flip to player's turn
+    sharedState->turn_order = 0;
+    localTurnOrder = 0;
+
+    // Trigger both fighters' attack animations
+    enemyFighters[enemyInCage].triggerAttack();
+    playerFighters[playerInCage].triggerAttack();
+
+    pthread_cond_broadcast(&sharedState->action_cv);
+    pthread_mutex_unlock(&sharedState->mtx);
+}
+
+void Visualizer::handleMouseClick(float x, float y) {
+    // No particle effects in plain white UI
+    (void)x;
+    (void)y;
+}
+
+// update logic
 
 void Visualizer::update(float dt) {
-    particles.update(dt);
+    if (isIntroActive) {
+        if (!introFrames.empty()) {
+            introFrameTimer += dt;
+            float frameDuration = 1.f / 30.f; // 30 FPS for intro
+            // Drain the accumulated timer, advancing one frame at a time
+            while (introFrameTimer >= frameDuration && isIntroActive) {
+                introFrameTimer -= frameDuration;
+                introFrameIndex++;
+                if (introFrameIndex >= static_cast<int>(introFrames.size())) {
+                    isIntroActive = false; // Intro finished — keep last frame visible
+                } else {
+                    introSprite.setTexture(introFrames[introFrameIndex]);
+                }
+            }
+        } else {
+            isIntroActive = false;
+        }
+        return; // Skip game update during intro
+    }
+
+    // ── Advance background frame ─────────────────────────────────────────────
+    if (!bgFrames.empty()) {
+        bgFrameTimer += dt;
+        float frameDuration = 1.f / BG_FPS;
+        if (bgFrameTimer >= frameDuration) {
+            bgFrameTimer -= frameDuration;
+            bgFrameIndex = (bgFrameIndex + 1) % static_cast<int>(bgFrames.size());
+            bgSprite.setTexture(bgFrames[bgFrameIndex]);
+        }
+    }
+
+    // ── Update fighter sprite animations ─────────────────────────────────────
+    for (int i = 0; i < MAX_PLAYERS; ++i) playerFighters[i].update(dt);
+    for (int i = 0; i < 4; ++i) enemyFighters[i].update(dt);
 
     if (!sharedState) return;
 
-    // Update quantum from slider
-    if (!sliders.empty()) {
+    // ── Sync localTurnOrder from the authoritative shared state ──────────────
+    pthread_mutex_lock(&sharedState->mtx);
+    localTurnOrder = sharedState->turn_order;
+
+    // ── Track which fighters are in the cage ─────────────────────────────────
+    // Only auto-update playerInCage/enemyInCage when the scheduler assigns a
+    // NEW character that the user hasn't explicitly selected yet.
+    // This preserves keyboard switching while still picking a valid live fighter.
+    if (sharedState->active_team == TEAM_PLAYER && sharedState->active_id >= 0
+        && sharedState->active_id < MAX_PLAYERS) {
+        // Only override if the user's selection is now dead
+        if (!sharedState->players[playerInCage].alive)
+            playerInCage = sharedState->active_id;
+    }
+    if (sharedState->active_team == TEAM_NPC && sharedState->active_id >= 0
+        && sharedState->active_id < 4) {
+        // Only override if the user's selection is now dead
+        if (!sharedState->npcs[enemyInCage].alive)
+            enemyInCage = sharedState->active_id;
+    }
+
+    // ── Detect HP changes → trigger attack animations ────────────────────────
+    for (int i = 0; i < sharedState->num_npcs && i < 4; ++i) {
+        int curHP = sharedState->npcs[i].hp;
+        if (lastHPNpcs[i] > 0 && curHP < lastHPNpcs[i] && sharedState->npcs[i].alive) {
+            // NPC took damage → player is attacking
+            if (playerInCage >= 0 && playerInCage < MAX_PLAYERS)
+                playerFighters[playerInCage].triggerAttack();
+        }
+        lastHPNpcs[i] = curHP;
+    }
+    for (int i = 0; i < sharedState->num_players && i < MAX_PLAYERS; ++i) {
+        int curHP = sharedState->players[i].hp;
+        if (lastHPPlayers[i] > 0 && curHP < lastHPPlayers[i] && sharedState->players[i].alive) {
+            // Player took damage → enemy is attacking
+            if (enemyInCage >= 0 && enemyInCage < 4)
+                enemyFighters[enemyInCage].triggerAttack();
+        }
+        lastHPPlayers[i] = curHP;
+    }
+    pthread_mutex_unlock(&sharedState->mtx);
+
+    if (sliderCount > 0) {
         quantumTime = sliders[0]->getValue();
     }
-    if (sliders.size() > 1) {
+    if (sliderCount > 1) {
         schedulingPriority = static_cast<int>(sliders[1]->getValue());
     }
 
+    // update button colors to reflect current scheduling/deadlock mode
+    for (int i = 0; i < 4; ++i) {
+        if (schedulingBtns[i]) {
+            bool isActive = (sharedState->scheduler_mode == static_cast<SchedulerMode>(i));
+            schedulingBtns[i]->setColors(
+                isActive ? sf::Color(180, 220, 180) : sf::Color(220, 220, 220),
+                isActive ? sf::Color(160, 210, 160) : sf::Color(200, 200, 200),
+                TEXT_PRIMARY);
+        }
+    }
+    for (int i = 0; i < 3; ++i) {
+        if (deadlockBtns[i]) {
+            bool isActive = (sharedState->deadlock_strategy == static_cast<DeadlockStrategy>(i));
+            deadlockBtns[i]->setColors(
+                isActive ? sf::Color(200, 180, 220) : sf::Color(220, 220, 220),
+                isActive ? sf::Color(190, 170, 210) : sf::Color(200, 200, 200),
+                TEXT_PRIMARY);
+        }
+    }
+
     updateComponents(dt);
-    updateMetrics();
-    updateGanttChart();
     updateProcessBlocks();
     updateConnections();
 }
 
 void Visualizer::updateComponents(float dt) {
+    (void)dt;
+    if (!sharedState) return;
     int now = now_epoch();
 
     pthread_mutex_lock(&sharedState->mtx);
 
-    // Update player cards
-    for (int i = 0; i < sharedState->num_players && i < static_cast<int>(playerCards.size()); ++i) {
+    for (int i = 0; i < sharedState->num_players && i < playerCardCount; ++i) {
         bool isActive = (sharedState->active_team == TEAM_PLAYER && sharedState->active_id == i);
         playerCards[i]->update(sharedState->players[i], isActive, now);
     }
 
-    // Update NPC cards
-    for (int i = 0; i < sharedState->num_npcs && i < static_cast<int>(npcCards.size()); ++i) {
+    for (int i = 0; i < sharedState->num_npcs && i < npcCardCount; ++i) {
         bool isActive = (sharedState->active_team == TEAM_NPC && sharedState->active_id == i);
         npcCards[i]->update(sharedState->npcs[i], isActive, now);
     }
 
-    // Update artifacts
     for (int i = 0; i < 3; ++i) {
         artifactDisplays[i]->update(sharedState->artifacts[i], i, sharedState->eclipse_present);
     }
 
-    // Update log panel
-    logPanel->update(sharedState);
-
-    // Update arbiter node
     bool isPolling = (sharedState->active_team != -1);
     arbiterNode->update(isPolling, sharedState->active_team, sharedState->active_id);
-
-    pthread_mutex_unlock(&sharedState->mtx);
-}
-
-void Visualizer::updateMetrics() {
-    float elapsed = metricsClock.getElapsedTime().asSeconds();
-    if (elapsed < 0.5f) return;
-    metricsClock.restart();
-
-    pthread_mutex_lock(&sharedState->mtx);
-
-    int turns = sharedState->turn_seq;
-    int kills = sharedState->kills;
-
-    // Calculate waiting time approximation
-    int waitingPlayers = 0;
-    int waitingNPCs = 0;
-    for (int i = 0; i < sharedState->num_players; ++i) {
-        if (sharedState->players[i].alive &&
-            sharedState->players[i].stamina < sharedState->players[i].max_stamina) {
-            waitingPlayers++;
-        }
-    }
-    for (int i = 0; i < sharedState->num_npcs; ++i) {
-        if (sharedState->npcs[i].alive &&
-            sharedState->npcs[i].stamina < sharedState->npcs[i].max_stamina) {
-            waitingNPCs++;
-        }
-    }
-
-    avgWaitingTime = (waitingPlayers + waitingNPCs) * quantumTime / std::max(1, sharedState->num_players + sharedState->num_npcs);
-    avgTurnaroundTime = static_cast<float>(turns) * quantumTime / std::max(1, kills);
-    cpuThroughput = static_cast<float>(kills) / std::max(1.f, simulationTime);
-
-    metricsDashboard->update(avgWaitingTime, avgTurnaroundTime, cpuThroughput,
-                              turns, kills,
-                              sharedState->num_players + sharedState->num_npcs);
-
-    pthread_mutex_unlock(&sharedState->mtx);
-}
-
-void Visualizer::updateGanttChart() {
-    pthread_mutex_lock(&sharedState->mtx);
-
-    // Add Gantt entries for active entity
-    if (sharedState->turn_seq != lastTurnSeq) {
-        float dur = quantumTime;
-        ganttChart->addEntry(sharedState->active_id, static_cast<TeamType>(sharedState->active_team),
-                             simulationTime - dur, dur);
-        lastTurnSeq = sharedState->turn_seq;
-    }
-
-    ganttChart->update(simulationTime);
 
     pthread_mutex_unlock(&sharedState->mtx);
 }
@@ -424,50 +903,47 @@ void Visualizer::updateProcessBlocks() {
     pthread_mutex_lock(&sharedState->mtx);
 
     int now = now_epoch();
-
-    // Map characters to process blocks
     int blockIdx = 0;
 
-    // Player processes
-    for (int i = 0; i < sharedState->num_players && blockIdx < static_cast<int>(processBlocks.size()); ++i) {
+    for (int i = 0; i < sharedState->num_players && blockIdx < processBlockCount; ++i) {
         auto& p = sharedState->players[i];
         if (!p.alive) continue;
 
-        float progress = static_cast<float>(p.stamina) / std::max(1, p.max_stamina);
+        float progress = static_cast<float>(p.stamina) / max(1, p.max_stamina);
         int state = (sharedState->active_team == TEAM_PLAYER && sharedState->active_id == i) ? 0 :
                     (p.stunned_until_epoch > now) ? 2 : 1;
 
-        processBlocks[blockIdx]->update(progress, state, "Player " + std::to_string(i));
+        processBlocks[blockIdx]->update(progress, state, "Player " + to_string(i));
         blockIdx++;
     }
 
-    // NPC processes
-    for (int i = 0; i < sharedState->num_npcs && blockIdx < static_cast<int>(processBlocks.size()); ++i) {
+    for (int i = 0; i < sharedState->num_npcs && blockIdx < processBlockCount; ++i) {
         auto& n = sharedState->npcs[i];
         if (!n.alive) continue;
 
-        float progress = static_cast<float>(n.stamina) / std::max(1, n.max_stamina);
+        float progress = static_cast<float>(n.stamina) / max(1, n.max_stamina);
         int state = (sharedState->active_team == TEAM_NPC && sharedState->active_id == i) ? 0 :
                     (n.stunned_until_epoch > now) ? 2 : 1;
 
-        processBlocks[blockIdx]->update(progress, state, "NPC " + std::to_string(i));
+        processBlocks[blockIdx]->update(progress, state, "NPC " + to_string(i));
         blockIdx++;
     }
 
-    // Hide unused blocks
-    for (; blockIdx < static_cast<int>(processBlocks.size()); ++blockIdx) {
-        processBlocks[blockIdx]->update(0.f, 1, "[EMPTY]");
+    // hide unused slots — don't show [EMPTY] for slots beyond actual process count
+    int activeCount = blockIdx;
+    for (; blockIdx < processBlockCount; ++blockIdx) {
+        processBlocks[blockIdx]->update(0.f, 3, "");  // state 3 = hidden
     }
+    (void)activeCount;
 
     pthread_mutex_unlock(&sharedState->mtx);
 
-    // Update HIP slots based on active assignments
-    for (int i = 0; i < static_cast<int>(hipSlots.size()); ++i) {
+    for (int i = 0; i < hipSlotCount; ++i) {
         pthread_mutex_lock(&sharedState->mtx);
         bool hasActive = (sharedState->active_team == TEAM_PLAYER &&
                          sharedState->active_id == i && i < sharedState->num_players);
         if (hasActive && sharedState->players[i].alive) {
-            hipSlots[i]->setOccupied(true, i, "Player " + std::to_string(i));
+            hipSlots[i]->setOccupied(true, i, "Player " + to_string(i));
         } else {
             hipSlots[i]->setOccupied(false);
         }
@@ -478,33 +954,36 @@ void Visualizer::updateProcessBlocks() {
 void Visualizer::updateConnections() {
     sf::Vector2f arbiterPos = arbiterNode->getPosition();
 
-    // Connection to player panel
-    if (connectionLines.size() > 0) {
-        connectionLines[0].setPoints(
-            arbiterPos,
-            sf::Vector2f(LEFT_PANEL_WIDTH + 20.f, HEADER_HEIGHT + 170.f));
-        bool active = (sharedState->active_team == TEAM_PLAYER);
-        connectionLines[0].setActive(active);
-        connectionLines[0].setColor(active ? NEON_GREEN : sf::Color(0, 255, 255, 40));
-    }
+    // Connection from arbiter (header) to left panel (players area)
+    connectionLines[0].setPoints(
+        arbiterPos,
+        sf::Vector2f(LEFT_PANEL_WIDTH - 10.f, HEADER_HEIGHT + 80.f));
+    bool active = (sharedState->active_team == TEAM_PLAYER);
+    connectionLines[0].setActive(active);
+    connectionLines[0].setColor(active ? ACCENT_GREEN : sf::Color(180, 180, 180, 40));
 
-    // Connection to NPC panel
-    if (connectionLines.size() > 1) {
-        connectionLines[1].setPoints(
-            arbiterPos,
-            sf::Vector2f(WINDOW_WIDTH / 2.f + 20.f, HEADER_HEIGHT + 170.f));
-        bool active = (sharedState->active_team == TEAM_NPC);
-        connectionLines[1].setActive(active);
-        connectionLines[1].setColor(active ? NEON_RED : sf::Color(0, 255, 255, 40));
-    }
+    // Connection from arbiter (header) to center (NPCs area)
+    connectionLines[1].setPoints(
+        arbiterPos,
+        sf::Vector2f(LEFT_PANEL_WIDTH + 20.f, HEADER_HEIGHT + 80.f));
+    active = (sharedState->active_team == TEAM_NPC);
+    connectionLines[1].setActive(active);
+    connectionLines[1].setColor(active ? ACCENT_RED : sf::Color(180, 180, 180, 40));
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// RENDERING
-// ═══════════════════════════════════════════════════════════════════════════
+// rendering
 
 void Visualizer::render() {
-    window.clear(BACKGROUND_DARK);
+    // Background will be drawn by renderBackground() (UFC stage video frames)
+    window.clear(sf::Color(0, 0, 0, 255));
+
+    if (isIntroActive) {
+        if (!introFrames.empty()) {
+            window.draw(introSprite);
+        }
+        window.display();
+        return;
+    }
 
     renderBackground();
     renderHeader();
@@ -523,272 +1002,263 @@ void Visualizer::render() {
 
     renderFooter();
     renderConnections();
-    particles.draw(window);
+    // No particles in plain UI
 
     window.display();
 }
 
 void Visualizer::renderBackground() {
-    // Subtle grid pattern
-    sf::VertexArray grid(sf::Lines);
-    for (float x = 0; x < WINDOW_WIDTH; x += 40.f) {
-        grid.append(sf::Vertex(sf::Vector2f(x, 0.f), sf::Color(30, 35, 50, 60)));
-        grid.append(sf::Vertex(sf::Vector2f(x, WINDOW_HEIGHT), sf::Color(30, 35, 50, 60)));
+    if (!bgFrames.empty()) {
+        // Draw the UFC stage video frame as a fullscreen background
+        window.draw(bgSprite);
+    } else {
+        // Fallback: solid dark colour if frames failed to load
+        window.clear(sf::Color(20, 20, 30, 255));
     }
-    for (float y = 0; y < WINDOW_HEIGHT; y += 40.f) {
-        grid.append(sf::Vertex(sf::Vector2f(0.f, y), sf::Color(30, 35, 50, 60)));
-        grid.append(sf::Vertex(sf::Vector2f(WINDOW_WIDTH, y), sf::Color(30, 35, 50, 60)));
-    }
-    window.draw(grid);
 }
 
 void Visualizer::renderHeader() {
-    // Header background
     sf::RectangleShape header(sf::Vector2f(WINDOW_WIDTH, HEADER_HEIGHT));
     header.setFillColor(BACKGROUND_PANEL);
-    header.setOutlineColor(NEON_CYAN);
+    header.setOutlineColor(BORDER_COLOR);
     header.setOutlineThickness(1.f);
     window.draw(header);
 
-    // Title
+    // Title - left side
     sf::Text title;
     title.setFont(mainFont);
     title.setString("CHRONO RIFT");
     title.setCharacterSize(FONT_TITLE);
-    title.setFillColor(NEON_CYAN);
+    title.setFillColor(ACCENT_BLUE);
     title.setStyle(sf::Text::Bold);
-    title.setPosition(20.f, 12.f);
+    title.setPosition(16.f, 8.f);
     window.draw(title);
 
-    // Subtitle
     sf::Text subtitle;
     subtitle.setFont(mainFont);
     subtitle.setString("OS Process Scheduling Visualizer");
     subtitle.setCharacterSize(FONT_SMALL);
     subtitle.setFillColor(TEXT_SECONDARY);
-    subtitle.setPosition(20.f, 42.f);
+    subtitle.setPosition(16.f, 42.f);
     window.draw(subtitle);
 
-    // Mode indicator
+    // Arbiter node centered in header
+    arbiterNode->draw(window);
+
+    // Mode label - right of center
     sf::Text modeText;
     modeText.setFont(mainFont);
-    std::string modeStr;
+    string modeStr;
     switch (currentMode) {
-        case ViewMode::COMBAT: modeStr = "[1] COMBAT"; break;
+        case ViewMode::COMBAT:    modeStr = "[1] COMBAT";    break;
         case ViewMode::SCHEDULER: modeStr = "[2] SCHEDULER"; break;
-        case ViewMode::HYBRID: modeStr = "[3] HYBRID"; break;
+        case ViewMode::HYBRID:    modeStr = "[3] HYBRID";    break;
     }
     modeText.setString(modeStr);
     modeText.setCharacterSize(FONT_SUBTITLE);
-    modeText.setFillColor(NEON_YELLOW);
-    modeText.setPosition(WINDOW_WIDTH / 2.f - 80.f, 18.f);
+    modeText.setFillColor(ACCENT_YELLOW);
+    modeText.setPosition(WINDOW_WIDTH / 2.f + 50.f, 14.f);
     window.draw(modeText);
 
-    // Status indicators
+    // Status - far right
     sf::Text statusText;
     statusText.setFont(mainFont);
     statusText.setCharacterSize(FONT_SMALL);
     statusText.setFillColor(TEXT_SECONDARY);
-    std::ostringstream ss;
-    ss << "Q:" << quantumTime << "s | P:" << schedulingPriority;
-    statusText.setString(ss.str());
-    statusText.setPosition(WINDOW_WIDTH - 200.f, 20.f);
+    char buf[128];
+    pthread_mutex_lock(&sharedState->mtx);
+    int seed = sharedState->roll_seed;
+    pthread_mutex_unlock(&sharedState->mtx);
+
+    snprintf(buf, sizeof(buf), "SEED:%d | Q:%.1fs | P:%d", seed, quantumTime, schedulingPriority);
+    statusText.setString(buf);
+    statusText.setPosition(WINDOW_WIDTH - 280.f, 12.f);
     window.draw(statusText);
+
+    // Panel separator lines (drawn on every frame below the header)
+    sf::RectangleShape leftDiv(sf::Vector2f(1.f, WINDOW_HEIGHT - HEADER_HEIGHT - FOOTER_HEIGHT));
+    leftDiv.setPosition(LEFT_PANEL_WIDTH, HEADER_HEIGHT);
+    leftDiv.setFillColor(BORDER_COLOR);
+    window.draw(leftDiv);
+
+    sf::RectangleShape rightDiv(sf::Vector2f(1.f, WINDOW_HEIGHT - HEADER_HEIGHT - FOOTER_HEIGHT));
+    rightDiv.setPosition(WINDOW_WIDTH - RIGHT_PANEL_WIDTH, HEADER_HEIGHT);
+    rightDiv.setFillColor(BORDER_COLOR);
+    window.draw(rightDiv);
 }
 
 void Visualizer::renderCombatView() {
-    pthread_mutex_lock(&sharedState->mtx);
+    // ═══════════════════════════════════════════════════════════════════════
+    //  UFC CAGE FIGHT VIEW
+    //  Background video is already rendered.  We draw fighters + roster.
+    // ═══════════════════════════════════════════════════════════════════════
 
-    // Player panel header
-    sf::Text pHeader;
-    pHeader.setFont(mainFont);
-    pHeader.setString("PLAYERS (" + std::to_string(sharedState->num_players) + ")");
-    pHeader.setCharacterSize(FONT_HEADER);
-    pHeader.setFillColor(NEON_GREEN);
-    pHeader.setStyle(sf::Text::Bold);
-    pHeader.setPosition(LEFT_PANEL_WIDTH + 20.f, HEADER_HEIGHT + 95.f);
-    window.draw(pHeader);
-
-    // NPC panel header
-    sf::Text nHeader;
-    nHeader.setFont(mainFont);
-    nHeader.setString("NPCS (" + std::to_string(sharedState->num_npcs) + ")");
-    nHeader.setCharacterSize(FONT_HEADER);
-    nHeader.setFillColor(NEON_RED);
-    nHeader.setStyle(sf::Text::Bold);
-    nHeader.setPosition(WINDOW_WIDTH / 2.f + 20.f, HEADER_HEIGHT + 95.f);
-    window.draw(nHeader);
-
-    pthread_mutex_unlock(&sharedState->mtx);
-
-    // Draw character cards
-    for (int i = 0; i < sharedState->num_players && i < static_cast<int>(playerCards.size()); ++i) {
-        playerCards[i]->draw(window);
-    }
-    for (int i = 0; i < sharedState->num_npcs && i < static_cast<int>(npcCards.size()); ++i) {
-        npcCards[i]->draw(window);
-    }
-
-    // Draw artifacts
-    for (auto& art : artifactDisplays) {
-        art->draw(window);
-    }
-
-    // Draw arbiter
-    arbiterNode->draw(window);
-
-    // Draw metrics
-    metricsDashboard->draw(window);
+    renderCageFighters();
+    renderTeamRoster();
+    renderOpponentRoster();
 }
 
 void Visualizer::renderSchedulerView() {
-    // Left panel - ASP Process blocks
+    // Left panel background
+    sf::RectangleShape lPanelBg(sf::Vector2f(LEFT_PANEL_WIDTH, WINDOW_HEIGHT - HEADER_HEIGHT - FOOTER_HEIGHT));
+    lPanelBg.setPosition(0.f, HEADER_HEIGHT);
+    lPanelBg.setFillColor(BACKGROUND_PANEL);
+    window.draw(lPanelBg);
+
     sf::Text aspHeader;
     aspHeader.setFont(mainFont);
-    aspHeader.setString("ASP — ACTIVE SCHEDULING PROCESSES");
-    aspHeader.setCharacterSize(FONT_HEADER);
-    aspHeader.setFillColor(NEON_YELLOW);
+    aspHeader.setString("ASP - ACTIVE SCHEDULING PROCESSES");
+    aspHeader.setCharacterSize(FONT_SUBTITLE);
+    aspHeader.setFillColor(ACCENT_YELLOW);
     aspHeader.setStyle(sf::Text::Bold);
-    aspHeader.setPosition(20.f, HEADER_HEIGHT + 75.f);
+    aspHeader.setPosition(10.f, HEADER_HEIGHT + 4.f);
     window.draw(aspHeader);
 
-    for (auto& block : processBlocks) {
-        block->draw(window);
+    for (int i = 0; i < processBlockCount; ++i) {
+        processBlocks[i]->draw(window);
     }
 
-    // Center - Arbiter
-    arbiterNode->draw(window);
-
-    // Right panel - HIP Resource slots
+    // Right panel: controls + HIP slots
     sf::Text hipHeader;
     hipHeader.setFont(mainFont);
-    hipHeader.setString("HIP — HARDWARE INTERFACE");
-    hipHeader.setCharacterSize(FONT_HEADER);
-    hipHeader.setFillColor(NEON_BLUE);
+    hipHeader.setString("HIP - HARDWARE INTERFACE");
+    hipHeader.setCharacterSize(FONT_SUBTITLE);
+    hipHeader.setFillColor(ACCENT_BLUE);
     hipHeader.setStyle(sf::Text::Bold);
-    hipHeader.setPosition(WINDOW_WIDTH - RIGHT_PANEL_WIDTH + 20.f, 380.f);
+    hipHeader.setPosition(WINDOW_WIDTH - RIGHT_PANEL_WIDTH + 10.f, HEADER_HEIGHT + 342.f);
     window.draw(hipHeader);
 
-    for (auto& slot : hipSlots) {
-        slot->draw(window);
+    for (int i = 0; i < hipSlotCount; ++i) {
+        hipSlots[i]->draw(window);
     }
 
-    // Draw controls
-    for (auto& btn : buttons) {
-        btn->draw(window);
+    for (int i = 0; i < buttonCount; ++i) {
+        buttons[i]->draw(window);
     }
-    for (auto& slider : sliders) {
-        slider->draw(window);
+    for (int i = 0; i < sliderCount; ++i) {
+        sliders[i]->draw(window);
     }
-
-    // Draw metrics
-    metricsDashboard->draw(window);
+    // Scheduling mode buttons
+    for (int i = 0; i < 4; ++i) {
+        if (schedulingBtns[i]) schedulingBtns[i]->draw(window);
+    }
+    // Deadlock strategy buttons
+    for (int i = 0; i < 3; ++i) {
+        if (deadlockBtns[i]) deadlockBtns[i]->draw(window);
+    }
 }
 
 void Visualizer::renderHybridView() {
-    // Combines both combat and scheduler views
-    // Left: ASP process blocks (scheduler view)
-    // Center: Character cards + Arbiter (combat view)
-    // Right: HIP slots + Metrics + Controls
+    // Left panel background
+    sf::RectangleShape lPanelBg(sf::Vector2f(LEFT_PANEL_WIDTH, WINDOW_HEIGHT - HEADER_HEIGHT - FOOTER_HEIGHT));
+    lPanelBg.setPosition(0.f, HEADER_HEIGHT);
+    lPanelBg.setFillColor(BACKGROUND_PANEL);
+    window.draw(lPanelBg);
 
-    // ── Left Panel: ASP Process Blocks ──
+    // Left: process blocks (first 5)
     sf::Text aspHeader;
     aspHeader.setFont(mainFont);
     aspHeader.setString("ASP PROCESSES");
     aspHeader.setCharacterSize(FONT_SUBTITLE);
-    aspHeader.setFillColor(NEON_YELLOW);
+    aspHeader.setFillColor(ACCENT_YELLOW);
     aspHeader.setStyle(sf::Text::Bold);
-    aspHeader.setPosition(20.f, HEADER_HEIGHT + 10.f);
+    aspHeader.setPosition(10.f, HEADER_HEIGHT + 4.f);
     window.draw(aspHeader);
 
-    int visibleBlocks = std::min(5, static_cast<int>(processBlocks.size()));
+    int visibleBlocks = cr_min(5, processBlockCount);
     for (int i = 0; i < visibleBlocks; ++i) {
         processBlocks[i]->draw(window);
     }
 
-    // ── Center: Character Cards ──
+    // Center: NPCs + Artifacts
     pthread_mutex_lock(&sharedState->mtx);
-
     sf::Text combatHeader;
     combatHeader.setFont(mainFont);
-    combatHeader.setString("COMBAT FIELD");
+    combatHeader.setString("COMBAT FIELD - NPCS (" + to_string(sharedState->num_npcs) + ")");
     combatHeader.setCharacterSize(FONT_SUBTITLE);
-    combatHeader.setFillColor(NEON_CYAN);
+    combatHeader.setFillColor(ACCENT_BLUE);
     combatHeader.setStyle(sf::Text::Bold);
-    combatHeader.setPosition(LEFT_PANEL_WIDTH + 20.f, HEADER_HEIGHT + 10.f);
+    combatHeader.setPosition(LEFT_PANEL_WIDTH + 10.f, HEADER_HEIGHT + 4.f);
     window.draw(combatHeader);
-
     pthread_mutex_unlock(&sharedState->mtx);
 
-    for (int i = 0; i < sharedState->num_players && i < static_cast<int>(playerCards.size()); ++i) {
-        playerCards[i]->draw(window);
-    }
-    for (int i = 0; i < sharedState->num_npcs && i < static_cast<int>(npcCards.size()); ++i) {
+    for (int i = 0; i < sharedState->num_npcs && i < npcCardCount; ++i) {
         npcCards[i]->draw(window);
     }
 
-    // ── Artifacts ──
-    for (auto& art : artifactDisplays) {
-        art->draw(window);
+    for (int i = 0; i < 3; ++i) {
+        artifactDisplays[i]->draw(window);
     }
 
-    // ── Center: Arbiter ──
-    arbiterNode->draw(window);
-
-    // ── Right Panel: HIP + Controls + Metrics ──
+    // Right: controls + HIP slots
     sf::Text hipHeader;
     hipHeader.setFont(mainFont);
     hipHeader.setString("HIP RESOURCES");
     hipHeader.setCharacterSize(FONT_SUBTITLE);
-    hipHeader.setFillColor(NEON_BLUE);
+    hipHeader.setFillColor(ACCENT_BLUE);
     hipHeader.setStyle(sf::Text::Bold);
-    hipHeader.setPosition(WINDOW_WIDTH - RIGHT_PANEL_WIDTH + 20.f, HEADER_HEIGHT + 10.f);
+    hipHeader.setPosition(WINDOW_WIDTH - RIGHT_PANEL_WIDTH + 10.f, HEADER_HEIGHT + 342.f);
     window.draw(hipHeader);
 
-    for (auto& slot : hipSlots) {
-        slot->draw(window);
+    for (int i = 0; i < hipSlotCount; ++i) {
+        hipSlots[i]->draw(window);
     }
 
-    // Controls
-    for (auto& btn : buttons) {
-        btn->draw(window);
+    for (int i = 0; i < buttonCount; ++i) {
+        buttons[i]->draw(window);
     }
-    for (auto& slider : sliders) {
-        slider->draw(window);
+    for (int i = 0; i < sliderCount; ++i) {
+        sliders[i]->draw(window);
     }
-
-    // Metrics
-    metricsDashboard->draw(window);
+    for (int i = 0; i < 4; ++i) {
+        if (schedulingBtns[i]) schedulingBtns[i]->draw(window);
+    }
+    for (int i = 0; i < 3; ++i) {
+        if (deadlockBtns[i]) deadlockBtns[i]->draw(window);
+    }
 }
 
 void Visualizer::renderFooter() {
-    // Footer background
-    sf::RectangleShape footer(sf::Vector2f(WINDOW_WIDTH, FOOTER_HEIGHT));
-    footer.setPosition(0.f, WINDOW_HEIGHT - FOOTER_HEIGHT);
-    footer.setFillColor(BACKGROUND_PANEL);
-    footer.setOutlineColor(BORDER_COLOR);
-    footer.setOutlineThickness(1.f);
-    window.draw(footer);
-
-    // Gantt chart
-    ganttChart->draw(window);
-
-    // Log panel
-    logPanel->draw(window);
-
-    // Controls hint
+    // Footer: two lines of keyboard hints at the very bottom
     sf::Text hintText;
     hintText.setFont(mainFont);
-    hintText.setString("[1]Combat [2]Scheduler [3]Hybrid | Space:Spawn | ESC:Exit");
     hintText.setCharacterSize(FONT_TINY);
     hintText.setFillColor(TEXT_DIM);
-    hintText.setPosition(WINDOW_WIDTH - 450.f, WINDOW_HEIGHT - 18.f);
+
+    // Line 1: View / system controls
+    hintText.setString("[1]Combat [2]Scheduler [3]Hybrid | Space:Spawn | ESC:Exit");
+    hintText.setPosition(WINDOW_WIDTH - 470.f, WINDOW_HEIGHT - 32.f);
     window.draw(hintText);
+
+    // Line 2: Combat controls
+    hintText.setString("Switch Player:W/A S/D  Switch Enemy:J/I L/K  | Player Attack: Q=Strike  E=Exhaust  | Enemy Attack: U=Strike  O=Exhaust");
+    hintText.setPosition(10.f, WINDOW_HEIGHT - 16.f);
+    window.draw(hintText);
+
+    // Turn indicator (centered above footer)
+    if (sharedState) {
+        pthread_mutex_lock(&sharedState->mtx);
+        int tOrder = sharedState->turn_order;
+        pthread_mutex_unlock(&sharedState->mtx);
+
+        sf::Text turnText;
+        turnText.setFont(mainFont);
+        turnText.setCharacterSize(FONT_SMALL);
+        bool playerTurn = (tOrder == 0);
+        turnText.setFillColor(playerTurn ? sf::Color(80, 220, 120, 255)
+                                        : sf::Color(255, 100, 80, 255));
+        turnText.setStyle(sf::Text::Bold);
+        turnText.setString(playerTurn ? ">> YOUR TURN — Press Q (Strike) or E (Exhaust)"
+                                      : ">> ENEMY TURN — Press U (Strike) or O (Exhaust)");
+        sf::FloatRect tb = turnText.getLocalBounds();
+        turnText.setPosition(WINDOW_WIDTH / 2.f - tb.width / 2.f, WINDOW_HEIGHT - 35.f);
+        window.draw(turnText);
+    }
 }
 
 void Visualizer::renderConnections() {
-    for (auto& line : connectionLines) {
-        line.draw(window);
+    for (int i = 0; i < 4; ++i) {
+        connectionLines[i].draw(window);
     }
 }
 
@@ -799,12 +1269,10 @@ void Visualizer::renderGameOver() {
     int kills = sharedState->kills;
     pthread_mutex_unlock(&sharedState->mtx);
 
-    // Dim overlay
     sf::RectangleShape overlay(sf::Vector2f(WINDOW_WIDTH, WINDOW_HEIGHT));
-    overlay.setFillColor(sf::Color(0, 0, 0, 180));
+    overlay.setFillColor(sf::Color(0, 0, 0, 120));
     window.draw(overlay);
 
-    // Result box
     float boxW = 500.f;
     float boxH = 300.f;
     float boxX = (WINDOW_WIDTH - boxW) / 2.f;
@@ -813,30 +1281,24 @@ void Visualizer::renderGameOver() {
     sf::RectangleShape box(sf::Vector2f(boxW, boxH));
     box.setPosition(boxX, boxY);
     box.setFillColor(BACKGROUND_PANEL);
-    box.setOutlineColor(won ? NEON_GREEN : NEON_RED);
-    box.setOutlineThickness(3.f);
+    box.setOutlineColor(won ? ACCENT_GREEN : ACCENT_RED);
+    box.setOutlineThickness(2.f);
     window.draw(box);
 
-    // Title
     sf::Text title;
     title.setFont(mainFont);
     title.setString(won ? "[ VICTORY ]" : "[ DEFEAT ]");
     title.setCharacterSize(36);
-    title.setFillColor(won ? NEON_GREEN : NEON_RED);
+    title.setFillColor(won ? ACCENT_GREEN : ACCENT_RED);
     title.setStyle(sf::Text::Bold);
     sf::FloatRect tb = title.getLocalBounds();
     title.setPosition(boxX + (boxW - tb.width) / 2.f, boxY + 30.f);
     window.draw(title);
 
-    // Stats
     sf::Text stats;
     stats.setFont(mainFont);
     stats.setCharacterSize(FONT_SUBTITLE);
     stats.setFillColor(TEXT_PRIMARY);
-
-    std::ostringstream ss;
-    ss << "Turns Played: " << turns << "\n";
-    ss << "NPCs Killed: " << kills << " / 10\n";
 
     int survivors = 0;
     pthread_mutex_lock(&sharedState->mtx);
@@ -845,27 +1307,25 @@ void Visualizer::renderGameOver() {
     }
     pthread_mutex_unlock(&sharedState->mtx);
 
-    ss << "Survivors: " << survivors << "\n";
-    ss << "Throughput: " << std::fixed << std::setprecision(2) << cpuThroughput << " kills/s\n";
-    ss << "Avg Turnaround: " << std::fixed << std::setprecision(2) << avgTurnaroundTime << "s";
-
-    stats.setString(ss.str());
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+        "Turns Played: %d\nNPCs Killed: %d\nSurvivors: %d\nThroughput: %.2f kills/s\nAvg Turnaround: %.2fs",
+        turns, kills, survivors, cpuThroughput, avgTurnaroundTime);
+    stats.setString(buf);
     stats.setPosition(boxX + 40.f, boxY + 100.f);
     window.draw(stats);
 
-    // Prompt
     sf::Text prompt;
     prompt.setFont(mainFont);
     prompt.setString("[ Press any key to exit ]");
     prompt.setCharacterSize(FONT_BODY);
-    prompt.setFillColor(NEON_CYAN);
+    prompt.setFillColor(ACCENT_BLUE);
     sf::FloatRect pb = prompt.getLocalBounds();
     prompt.setPosition(boxX + (boxW - pb.width) / 2.f, boxY + boxH - 50.f);
     window.draw(prompt);
 
     window.display();
 
-    // Wait for key
     bool waiting = true;
     while (waiting && window.isOpen()) {
         sf::Event ev;
@@ -882,18 +1342,16 @@ void Visualizer::renderGameOver() {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// ACTIONS
-// ═══════════════════════════════════════════════════════════════════════════
+// button callbacks and misc actions
 
 void Visualizer::spawnNewProcess() {
-    particles.emit(100.f, 200.f, NEON_GREEN, 20);
+    // No particle effects in plain UI
     totalProcessesSpawned++;
 }
 
 void Visualizer::switchMode(ViewMode mode) {
     currentMode = mode;
-    particles.emit(WINDOW_WIDTH / 2.f, HEADER_HEIGHT + 50.f, NEON_CYAN, 15);
+    // No particle effects in plain UI
 }
 
 sf::Color Visualizer::getStateColor(int state) const {
@@ -905,7 +1363,7 @@ sf::Color Visualizer::getStateColor(int state) const {
     }
 }
 
-std::string Visualizer::actionToString(ActionType action) const {
+string Visualizer::actionToString(ActionType action) const {
     switch (action) {
         case ACT_NONE: return "None";
         case ACT_STRIKE: return "Strike";
@@ -921,3 +1379,425 @@ std::string Visualizer::actionToString(ActionType action) const {
 }
 
 } // namespace ChronoRift
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  UFC CAGE RENDERING METHODS  (appended outside namespace, re-opened)
+// ═══════════════════════════════════════════════════════════════════════════
+namespace ChronoRift {
+
+// ── Render two fighters facing each other inside the cage ────────────────
+void Visualizer::renderCageFighters() {
+    if (!sharedState) return;
+
+    pthread_mutex_lock(&sharedState->mtx);
+    int pIdx = playerInCage;
+    int eIdx = enemyInCage;
+    int pHP = 0, pMaxHP = 1, eHP = 0, eMaxHP = 1;
+    bool pAlive = false, eAlive = false;
+    string pName = (pIdx >= 0 && pIdx < 4) ? PLAYER_NAMES[pIdx] : "???";
+    string eName = (eIdx >= 0 && eIdx < 4) ? ENEMY_NAMES[eIdx]  : "???";
+
+    if (pIdx >= 0 && pIdx < sharedState->num_players) {
+        pHP    = sharedState->players[pIdx].hp;
+        pMaxHP = max(1, sharedState->players[pIdx].max_hp);
+        pAlive = sharedState->players[pIdx].alive;
+    }
+    if (eIdx >= 0 && eIdx < sharedState->num_npcs) {
+        eHP    = sharedState->npcs[eIdx].hp;
+        eMaxHP = max(1, sharedState->npcs[eIdx].max_hp);
+        eAlive = sharedState->npcs[eIdx].alive;
+    }
+    pthread_mutex_unlock(&sharedState->mtx);
+
+    // Fighter scale: fit sprite into ~420px height
+    float targetH = 420.f;
+    float pScale = 1.f, eScale = 1.f;
+    if (playerFighters[pIdx].isLoaded() && playerFighters[pIdx].getActiveFrameHeight() > 0)
+        pScale = targetH / static_cast<float>(playerFighters[pIdx].getActiveFrameHeight());
+    if (enemyFighters[eIdx].isLoaded() && enemyFighters[eIdx].getActiveFrameHeight() > 0)
+        eScale = targetH / static_cast<float>(enemyFighters[eIdx].getActiveFrameHeight());
+
+    // Fighter positions
+    float pX = 180.f;                              // player on left
+    float eX = WINDOW_WIDTH - 600.f;               // enemy on right
+    float fighterY = HEADER_HEIGHT + 240.f;         // top of sprite
+
+    // When EITHER fighter is attacking, BOTH move to center of the cage
+    bool anyAttacking = (playerFighters[pIdx].getState() == FighterSprite::ANIM_ATTACKING)
+                     || (enemyFighters[eIdx].getState() == FighterSprite::ANIM_ATTACKING);
+    float pOffset = anyAttacking ? 320.f : 0.f;
+    float eOffset = anyAttacking ? -320.f : 0.f;
+
+    // Draw player fighter (faces right)
+    if (pAlive && playerFighters[pIdx].isLoaded()) {
+        playerFighters[pIdx].draw(window, pX + pOffset, fighterY, pScale, false);
+    }
+
+    // Draw enemy fighter (faces left)
+    if (eAlive && enemyFighters[eIdx].isLoaded()) {
+        enemyFighters[eIdx].draw(window, eX + eOffset, fighterY, eScale, false);
+    }
+
+    // ── HP Bars ──────────────────────────────────────────────────────────
+    float hpBarW = 280.f;
+    float hpBarY = HEADER_HEIGHT + 90.f;
+
+    // Player HP bar (left-aligned)
+    renderFighterHP(100.f, hpBarY, hpBarW, pHP, pMaxHP, pName,
+                    sf::Color(60, 180, 80, 255), false);
+
+    // Enemy HP bar (right-aligned)
+    renderFighterHP(WINDOW_WIDTH - 100.f - hpBarW, hpBarY, hpBarW, eHP, eMaxHP, eName,
+                    sf::Color(200, 60, 60, 255), true);
+
+    // ── VS Badge in center ──────────────────────────────────────────────
+    sf::Text vsText;
+    vsText.setFont(mainFont);
+    vsText.setString("VS");
+    vsText.setCharacterSize(42);
+    vsText.setFillColor(sf::Color(255, 215, 0, 255));
+    vsText.setStyle(sf::Text::Bold);
+    sf::FloatRect vb = vsText.getLocalBounds();
+    vsText.setPosition(WINDOW_WIDTH / 2.f - vb.width / 2.f,
+                       HEADER_HEIGHT + 260.f);
+    window.draw(vsText);
+
+    // ── Artifacts row (compact, centered above roster) ──────────────────
+    float artRowY = CAGE_BOTTOM - 62.f;
+    float artW    = 100.f;
+    float artGap  = 15.f;
+    float artTotalW = 3.f * artW + 2.f * artGap;
+    float artStartX = (WINDOW_WIDTH - artTotalW) / 2.f;
+
+    sf::Text artLabel;
+    artLabel.setFont(mainFont);
+    artLabel.setString("ARTIFACTS");
+    artLabel.setCharacterSize(FONT_SMALL);
+    artLabel.setFillColor(sf::Color(200, 170, 255, 200));
+    artLabel.setStyle(sf::Text::Bold);
+    sf::FloatRect alb = artLabel.getLocalBounds();
+    artLabel.setPosition(WINDOW_WIDTH / 2.f - alb.width / 2.f, artRowY - 18.f);
+    window.draw(artLabel);
+
+    for (int i = 0; i < 3; ++i) {
+        artifactDisplays[i]->draw(window);
+    }
+}
+
+// ── Render HP bar with name label ────────────────────────────────────────
+void Visualizer::renderFighterHP(float x, float y, float width,
+                                  int hp, int maxHp,
+                                  const string& name, sf::Color barColor,
+                                  bool /*alignRight*/) {
+    // Name label above bar
+    sf::Text nameText;
+    nameText.setFont(mainFont);
+    nameText.setString(name);
+    nameText.setCharacterSize(FONT_SUBTITLE);
+    nameText.setFillColor(sf::Color(255, 255, 255, 230));
+    nameText.setStyle(sf::Text::Bold);
+    nameText.setPosition(x, y - 2.f);
+    window.draw(nameText);
+
+    // Bar background
+    float barH = 18.f;
+    float barY = y + 20.f;
+    sf::RectangleShape barBg(sf::Vector2f(width, barH));
+    barBg.setPosition(x, barY);
+    barBg.setFillColor(sf::Color(40, 40, 40, 180));
+    barBg.setOutlineColor(sf::Color(100, 100, 100, 200));
+    barBg.setOutlineThickness(1.f);
+    window.draw(barBg);
+
+    // Bar fill
+    float ratio = static_cast<float>(hp) / static_cast<float>(max(1, maxHp));
+    ratio = (ratio < 0.f) ? 0.f : (ratio > 1.f) ? 1.f : ratio;
+
+    // Color shifts: green > yellow > red based on HP ratio
+    sf::Color fillColor = barColor;
+    if (ratio > 0.5f) fillColor = sf::Color(60, 180, 80, 255);
+    else if (ratio > 0.2f) fillColor = sf::Color(220, 180, 30, 255);
+    else fillColor = sf::Color(200, 50, 50, 255);
+
+    sf::RectangleShape barFill(sf::Vector2f(width * ratio, barH));
+    barFill.setPosition(x, barY);
+    barFill.setFillColor(fillColor);
+    window.draw(barFill);
+
+    // HP text on bar
+    char hpBuf[32];
+    snprintf(hpBuf, sizeof(hpBuf), "%d / %d", hp, maxHp);
+    sf::Text hpText;
+    hpText.setFont(mainFont);
+    hpText.setString(hpBuf);
+    hpText.setCharacterSize(FONT_TINY);
+    hpText.setFillColor(sf::Color(255, 255, 255, 220));
+    hpText.setPosition(x + 6.f, barY + 1.f);
+    window.draw(hpText);
+}
+
+// ── Team Roster (bottom-left) ────────────────────────────────────────────
+void Visualizer::renderTeamRoster() {
+    if (!sharedState) return;
+    float rosterY = CAGE_BOTTOM;
+
+    // Semi-transparent dark panel background
+    sf::RectangleShape panel(sf::Vector2f(WINDOW_WIDTH / 2.f - 10.f, ROSTER_HEIGHT));
+    panel.setPosition(0.f, rosterY);
+    panel.setFillColor(sf::Color(10, 10, 30, 180));
+    window.draw(panel);
+
+    // "TEAM ROSTER" label
+    sf::Text label;
+    label.setFont(mainFont);
+    label.setString("TEAM ROSTER");
+    label.setCharacterSize(FONT_SUBTITLE);
+    label.setFillColor(sf::Color(80, 200, 255, 255));
+    label.setStyle(sf::Text::Bold);
+    label.setPosition(20.f, rosterY + 6.f);
+    window.draw(label);
+
+    // Blue accent line under label
+    sf::RectangleShape accentLine(sf::Vector2f(WINDOW_WIDTH / 2.f - 30.f, 2.f));
+    accentLine.setPosition(15.f, rosterY + 28.f);
+    accentLine.setFillColor(sf::Color(60, 160, 255, 180));
+    window.draw(accentLine);
+
+    // Portrait cards
+    float cardW = 110.f;
+    float cardH = 140.f;
+    float cardGap = 15.f;
+    float totalCardsW = 4.f * cardW + 3.f * cardGap;
+    float startX = (WINDOW_WIDTH / 2.f - totalCardsW) / 2.f;
+    float startY = rosterY + 38.f;
+
+    pthread_mutex_lock(&sharedState->mtx);
+    int numP = sharedState->num_players;
+
+    for (int i = 0; i < 4 && i < numP; ++i) {
+        float cx = startX + i * (cardW + cardGap);
+        float cy = startY;
+        bool isActive = (i == playerInCage);
+        bool isAlive  = sharedState->players[i].alive;
+
+        // Card background
+        sf::RectangleShape card(sf::Vector2f(cardW, cardH));
+        card.setPosition(cx, cy);
+
+        if (!isAlive) {
+            card.setFillColor(sf::Color(30, 30, 30, 150));
+            card.setOutlineColor(sf::Color(80, 80, 80, 150));
+        } else if (isActive) {
+            card.setFillColor(sf::Color(20, 60, 100, 200));
+            card.setOutlineColor(sf::Color(80, 200, 255, 255));
+        } else {
+            card.setFillColor(sf::Color(20, 30, 50, 180));
+            card.setOutlineColor(sf::Color(60, 100, 160, 180));
+        }
+        card.setOutlineThickness(isActive ? 3.f : 1.f);
+        window.draw(card);
+
+        // Portrait: use first frame of standing spritesheet
+        if (playerFighters[i].isLoaded()) {
+            sf::Sprite portrait;
+            portrait.setTexture(playerFighters[i].getStandingTexture());
+            portrait.setTextureRect(playerFighters[i].getPortraitRect());
+            float fw = static_cast<float>(playerFighters[i].getFrameWidth());
+            float fh = static_cast<float>(playerFighters[i].getFrameHeight());
+            float portraitH = cardH - 30.f;  // leave room for name
+            float scale = portraitH / fh;
+            float scaledW = fw * scale;
+
+            // Center the portrait horizontally in the card
+            float offsetX = (cardW - scaledW) / 2.f;
+            portrait.setPosition(cx + offsetX, cy);
+            portrait.setScale(scale, scale);
+            if (!isAlive) portrait.setColor(sf::Color(100, 100, 100, 150));
+            window.draw(portrait);
+        }
+
+        // Fighter name below portrait
+        sf::Text nameText;
+        nameText.setFont(mainFont);
+        nameText.setString(PLAYER_NAMES[i]);
+        nameText.setCharacterSize(FONT_SMALL);
+        nameText.setFillColor(isAlive ? sf::Color(200, 230, 255, 255) : sf::Color(120, 120, 120, 180));
+        nameText.setStyle(sf::Text::Bold);
+        sf::FloatRect nb = nameText.getLocalBounds();
+        nameText.setPosition(cx + (cardW - nb.width) / 2.f, cy + cardH - 24.f);
+        window.draw(nameText);
+
+        // Small HP bar at bottom of card
+        if (isAlive) {
+            float barW = cardW - 10.f;
+            float barH = 4.f;
+            float barX = cx + 5.f;
+            float barY2 = cy + cardH - 6.f;
+            float hpRatio = static_cast<float>(sharedState->players[i].hp) /
+                            static_cast<float>(max(1, sharedState->players[i].max_hp));
+
+            sf::RectangleShape hpBg(sf::Vector2f(barW, barH));
+            hpBg.setPosition(barX, barY2);
+            hpBg.setFillColor(sf::Color(40, 40, 40, 180));
+            window.draw(hpBg);
+
+            sf::RectangleShape hpFill(sf::Vector2f(barW * hpRatio, barH));
+            hpFill.setPosition(barX, barY2);
+            hpFill.setFillColor(hpRatio > 0.5f ? sf::Color(60, 200, 80) :
+                                hpRatio > 0.2f ? sf::Color(220, 180, 30) :
+                                                  sf::Color(200, 50, 50));
+            window.draw(hpFill);
+        }
+
+        // DEAD overlay
+        if (!isAlive) {
+            sf::Text deadText;
+            deadText.setFont(mainFont);
+            deadText.setString("DEAD");
+            deadText.setCharacterSize(FONT_HEADER);
+            deadText.setFillColor(sf::Color(200, 50, 50, 200));
+            deadText.setStyle(sf::Text::Bold);
+            sf::FloatRect db = deadText.getLocalBounds();
+            deadText.setPosition(cx + (cardW - db.width) / 2.f,
+                                 cy + (cardH - db.height) / 2.f);
+            window.draw(deadText);
+        }
+    }
+
+    pthread_mutex_unlock(&sharedState->mtx);
+}
+
+// ── Opponent Roster (bottom-right) ───────────────────────────────────────
+void Visualizer::renderOpponentRoster() {
+    if (!sharedState) return;
+    float rosterY = CAGE_BOTTOM;
+    float panelX = WINDOW_WIDTH / 2.f + 10.f;
+    float panelW = WINDOW_WIDTH / 2.f - 10.f;
+
+    // Semi-transparent dark panel background
+    sf::RectangleShape panel(sf::Vector2f(panelW, ROSTER_HEIGHT));
+    panel.setPosition(panelX, rosterY);
+    panel.setFillColor(sf::Color(30, 10, 10, 180));
+    window.draw(panel);
+
+    // "OPPONENT ROSTER" label
+    sf::Text label;
+    label.setFont(mainFont);
+    label.setString("OPPONENT ROSTER");
+    label.setCharacterSize(FONT_SUBTITLE);
+    label.setFillColor(sf::Color(255, 100, 80, 255));
+    label.setStyle(sf::Text::Bold);
+    label.setPosition(panelX + 20.f, rosterY + 6.f);
+    window.draw(label);
+
+    // Red accent line under label
+    sf::RectangleShape accentLine(sf::Vector2f(panelW - 30.f, 2.f));
+    accentLine.setPosition(panelX + 15.f, rosterY + 28.f);
+    accentLine.setFillColor(sf::Color(255, 80, 60, 180));
+    window.draw(accentLine);
+
+    // Portrait cards
+    float cardW = 110.f;
+    float cardH = 140.f;
+    float cardGap = 15.f;
+    float totalCardsW = 4.f * cardW + 3.f * cardGap;
+    float startX = panelX + (panelW - totalCardsW) / 2.f;
+    float startY = rosterY + 38.f;
+
+    pthread_mutex_lock(&sharedState->mtx);
+    int numN = sharedState->num_npcs;
+
+    for (int i = 0; i < 4 && i < numN; ++i) {
+        float cx = startX + i * (cardW + cardGap);
+        float cy = startY;
+        bool isActive = (i == enemyInCage);
+        bool isAlive  = sharedState->npcs[i].alive;
+
+        // Card background
+        sf::RectangleShape card(sf::Vector2f(cardW, cardH));
+        card.setPosition(cx, cy);
+
+        if (!isAlive) {
+            card.setFillColor(sf::Color(30, 30, 30, 150));
+            card.setOutlineColor(sf::Color(80, 80, 80, 150));
+        } else if (isActive) {
+            card.setFillColor(sf::Color(100, 20, 20, 200));
+            card.setOutlineColor(sf::Color(255, 100, 80, 255));
+        } else {
+            card.setFillColor(sf::Color(50, 20, 20, 180));
+            card.setOutlineColor(sf::Color(160, 60, 60, 180));
+        }
+        card.setOutlineThickness(isActive ? 3.f : 1.f);
+        window.draw(card);
+
+        // Portrait: use first frame of standing spritesheet
+        if (enemyFighters[i].isLoaded()) {
+            sf::Sprite portrait;
+            portrait.setTexture(enemyFighters[i].getStandingTexture());
+            portrait.setTextureRect(enemyFighters[i].getPortraitRect());
+            float fw = static_cast<float>(enemyFighters[i].getFrameWidth());
+            float fh = static_cast<float>(enemyFighters[i].getFrameHeight());
+            float portraitH = cardH - 30.f;
+            float scale = portraitH / fh;
+            float scaledW = fw * scale;
+
+            float offsetX = (cardW - scaledW) / 2.f;
+            portrait.setPosition(cx + offsetX, cy);
+            portrait.setScale(scale, scale);
+            if (!isAlive) portrait.setColor(sf::Color(100, 100, 100, 150));
+            window.draw(portrait);
+        }
+
+        // Fighter name below portrait
+        sf::Text nameText;
+        nameText.setFont(mainFont);
+        nameText.setString(ENEMY_NAMES[i]);
+        nameText.setCharacterSize(FONT_SMALL);
+        nameText.setFillColor(isAlive ? sf::Color(255, 200, 200, 255) : sf::Color(120, 120, 120, 180));
+        nameText.setStyle(sf::Text::Bold);
+        sf::FloatRect nb = nameText.getLocalBounds();
+        nameText.setPosition(cx + (cardW - nb.width) / 2.f, cy + cardH - 24.f);
+        window.draw(nameText);
+
+        // Small HP bar at bottom of card
+        if (isAlive) {
+            float barW = cardW - 10.f;
+            float barH = 4.f;
+            float barX = cx + 5.f;
+            float barY2 = cy + cardH - 6.f;
+            float hpRatio = static_cast<float>(sharedState->npcs[i].hp) /
+                            static_cast<float>(max(1, sharedState->npcs[i].max_hp));
+
+            sf::RectangleShape hpBg(sf::Vector2f(barW, barH));
+            hpBg.setPosition(barX, barY2);
+            hpBg.setFillColor(sf::Color(40, 40, 40, 180));
+            window.draw(hpBg);
+
+            sf::RectangleShape hpFill(sf::Vector2f(barW * hpRatio, barH));
+            hpFill.setPosition(barX, barY2);
+            hpFill.setFillColor(hpRatio > 0.5f ? sf::Color(60, 200, 80) :
+                                hpRatio > 0.2f ? sf::Color(220, 180, 30) :
+                                                  sf::Color(200, 50, 50));
+            window.draw(hpFill);
+        }
+
+        // DEAD overlay
+        if (!isAlive) {
+            sf::Text deadText;
+            deadText.setFont(mainFont);
+            deadText.setString("DEAD");
+            deadText.setCharacterSize(FONT_HEADER);
+            deadText.setFillColor(sf::Color(200, 50, 50, 200));
+            deadText.setStyle(sf::Text::Bold);
+            sf::FloatRect db = deadText.getLocalBounds();
+            deadText.setPosition(cx + (cardW - db.width) / 2.f,
+                                 cy + (cardH - db.height) / 2.f);
+            window.draw(deadText);
+        }
+    }
+
+    pthread_mutex_unlock(&sharedState->mtx);
+}
+
+} // namespace ChronoRift
+

@@ -1,21 +1,4 @@
-/**
- * ╔═══════════════════════════════════════════════════════════════════════════╗
- * ║  COMMON.HPP — Utility Functions for Chrono Rift                        ║
- * ║  OS Concepts: Shared Memory IPC, Utility Functions                       ║
- * ╚═══════════════════════════════════════════════════════════════════════════╝
- *
- * Utility functions for shared memory operations and weapon management.
- * Included by all three processes (arbiter, hip, asp).
- *
- * OS Concepts:
- *   - Shared Memory IPC: map_shared() wraps shm_open + mmap for creation/attachment
- *   - Synchronization: add_log() writes to the circular log buffer atomically
- *   - Resource Management: Weapon inventory allocation with contiguous slot packing
- *
- * Usage:
- *   - Arbiter (creator): SharedState* s = map_shared(true);  // creates region
- *   - HIP/ASP (attach):  SharedState* s = map_shared(false); // attaches
- */
+// common.hpp - shared helpers used by all three processes
 
 #pragma once
 
@@ -23,104 +6,94 @@
 
 #include <ctime>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <fcntl.h>
 #include <iostream>
-#include <random>
-#include <string>
-#include <sys/mman.h>
+#include <sys/shm.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
 
-// ═══════════════════════════════════════════════════════════════════════════
-// TIME — Unix epoch time for stun scheduling and timeouts
-
-// Returns current Unix timestamp as int.
-// Used for stun expiration checks and condition variable timeouts.
+// current unix timestamp (for stun expiry checks)
 inline int now_epoch() {
     return static_cast<int>(std::time(nullptr));
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// WEAPON DEFINITION LOOKUP
-
-// Returns the WeaponDef for a given WeaponId.
-// OS Concept: Static dispatch on enum — weapons are global constants.
+// lookup weapon definition by id
 inline WeaponDef weapon_def(WeaponId id) {
-    for (auto& w : WEAPONS) {
-        if (w.id == id) return w;
+    for (int i = 0; i < 10; ++i) {
+        if (WEAPONS[i].id == id) return WEAPONS[i];
     }
     return WEAPONS[0];
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// SHARED MEMORY IPC — POSIX shared memory attachment/creation
-// ═══════════════════════════════════════════════════════════════════════════
-//
-// OS Concepts: shm_open + mmap for POSIX shared memory IPC.
-//
-// map_shared(true)  — Arbiter: Creates /dev/shm/chrono_rift_shm, truncates to
-//                      sizeof(SharedState), maps into own address space.
-//
-// map_shared(false) — HIP/ASP: Opens existing region, maps into own address
-//                      space. Returns nullptr if region doesn't exist yet.
-//
-// The region is created at /dev/shm/chrono_rift_shm (visible as /dev/shm/).
-// On Linux, /dev/shm is a tmpfs mounted at /dev/shm.
-//
-// Memory layout: SharedState struct is mapped at a fixed virtual address
-// in all three processes, allowing direct pointer access across boundaries.
+// shared memory helpers (System V)
 
+static const int SHM_KEY_ID = 0x43; // 'C' for Chrono
+
+// create=true for arbiter, false for hip/asp to attach
 inline SharedState* map_shared(bool create) {
-    // Unlink first if creating — ensures a fresh state every launch.
-    if (create) shm_unlink(SHM_NAME);
-
-    int flags = create ? (O_CREAT | O_RDWR) : O_RDWR;
-    int fd = shm_open(SHM_NAME, flags, 0666);
-    if (fd < 0) {
-        if (create || errno != ENOENT) {
-            perror("shm_open");
-        }
+    key_t key = ftok("/tmp", SHM_KEY_ID);
+    if (key == -1) {
+        perror("ftok");
         return nullptr;
     }
 
-    // Size the shared memory object to exactly sizeof(SharedState)
+    int shmid;
     if (create) {
-        if (ftruncate(fd, sizeof(SharedState)) != 0) {
-            perror("ftruncate");
-            close(fd);
-            return nullptr;
-        }
+        // clear old segment if it exists
+        shmid = shmget(key, sizeof(SharedState), 0666);
+        if (shmid >= 0) shmctl(shmid, IPC_RMID, nullptr);
+        shmid = shmget(key, sizeof(SharedState), IPC_CREAT | 0666);
+    } else {
+        shmid = shmget(key, sizeof(SharedState), 0666);
     }
 
-    // Map into process address space with read-write, shared access
-    void* mem = mmap(nullptr, sizeof(SharedState), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    close(fd); // fd no longer needed after mmap
-    if (mem == MAP_FAILED) {
-        perror("mmap");
+    if (shmid < 0) {
+        perror("shmget");
+        return nullptr;
+    }
+
+    void* mem = shmat(shmid, nullptr, 0);
+    if (mem == (void*)-1) {
+        perror("shmat");
         return nullptr;
     }
     return static_cast<SharedState*>(mem);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// LOGGING — Thread-safe circular log buffer write
-// ═══════════════════════════════════════════════════════════════════════════
+// detach and optionally destroy shared memory
+inline void cleanup_shared(SharedState* s, bool destroy) {
+    if (destroy && s != nullptr) {
+        // semaphores must be destroyed before we detach, not after
+        sem_destroy(&s->action_sem);
+        sem_destroy(&s->turn_sem);
+        sem_destroy(&s->log_sem);
 
-// Writes a message to the circular log buffer.
-// OS Concept: Atomic string write — snprintf + index update is the write point.
-// The caller holds g->mtx when calling this (ensuring single-writer).
-inline void add_log(SharedState* s, const std::string& msg) {
-    std::snprintf(s->logs[s->log_head], MAX_LOG_LEN, "%s", msg.c_str());
+        key_t key = ftok("/tmp", SHM_KEY_ID);
+        int shmid = shmget(key, sizeof(SharedState), 0666);
+        if (shmid >= 0) {
+            shmctl(shmid, IPC_RMID, nullptr);
+        }
+    }
+    // Now safe to detach
+    shmdt(s);
+}
+
+// write to circular log buffer (lock before calling this)
+inline void add_log(SharedState* s, const char* msg) {
+    std::snprintf(s->logs[s->log_head], MAX_LOG_LEN, "%s", msg);
     s->log_head = (s->log_head + 1) % MAX_LOG;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// CHARACTER LOOKUP — Resolve team+id to CharacterState pointer
-// ═══════════════════════════════════════════════════════════════════════════
+// overload so we can pass std::string directly
+inline void add_log(SharedState* s, const std::string& msg) {
+    add_log(s, msg.c_str());
+}
 
-// Returns pointer to the character for given team and id.
-// OS Concept: Array dispatch — players[0..num_players-1], npcs[0..num_npcs-1].
-// Returns nullptr if out of bounds (caller must check).
+// character lookup
+
 inline CharacterState* get_character(SharedState* s, int team, int id) {
     if (team == TEAM_PLAYER) {
         if (id < 0 || id >= s->num_players) return nullptr;
@@ -129,9 +102,6 @@ inline CharacterState* get_character(SharedState* s, int team, int id) {
     if (id < 0 || id >= s->num_npcs) return nullptr;
     return &s->npcs[id];
 }
-
-// ═══════════════════════════════════════════════════════════════════════════
-// FIRST LIVING — Find first alive character of a team
 
 inline int first_living_player(SharedState* s) {
     for (int i = 0; i < s->num_players; ++i) if (s->players[i].alive) return i;
@@ -143,11 +113,9 @@ inline int first_living_npc(SharedState* s) {
     return -1;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// WEAPON MANAGEMENT — Inventory slot allocation (OS Concept: Packing)
-// ═══════════════════════════════════════════════════════════════════════════
+// weapon inventory helpers
 
-// Checks if a character has a weapon in their inventory.
+// check if character has a weapon in inventory
 inline bool has_weapon(CharacterState* c, WeaponId id) {
     for (int i = 0; i < INVENTORY_SLOTS; ++i) {
         if (c->inventory[i] == static_cast<int>(id)) return true;
@@ -155,17 +123,15 @@ inline bool has_weapon(CharacterState* c, WeaponId id) {
     return false;
 }
 
-// Removes all slots occupied by a given weapon from inventory.
+// remove all slots of a weapon from inventory
 inline void clear_weapon_from_inventory(CharacterState* c, WeaponId id) {
     for (int i = 0; i < INVENTORY_SLOTS; ++i) {
         if (c->inventory[i] == static_cast<int>(id)) c->inventory[i] = 0;
     }
 }
 
-// Allocates consecutive inventory slots for a weapon.
-// OS Concept: First-fit contiguous allocation — finds the first run of
-// free slots large enough to hold the weapon.
-// Returns true on success, false if not enough contiguous space.
+// first-fit contiguous allocation for weapon slots
+// returns true if we found space and placed it
 inline bool allocate_weapon(CharacterState* c, WeaponId id) {
     auto w = weapon_def(id);
     for (int i = 0; i + w.slots <= INVENTORY_SLOTS; ++i) {
@@ -179,10 +145,7 @@ inline bool allocate_weapon(CharacterState* c, WeaponId id) {
     return false;
 }
 
-// Swaps out weapons to make room for a needed weapon.
-// Strategy: Try direct allocation, then evict weapons one at a time.
-// OS Concept: Memory management with eviction — LRU-style weapon eviction.
-// Evicted weapons go to storage, which is checked by SWAP_IN action.
+// swap out weapons to make room, evicting one at a time to storage
 inline bool swap_out_minimal(CharacterState* c, WeaponId need) {
     auto try_after_clear = [&]() {
         return allocate_weapon(c, need);
@@ -190,7 +153,7 @@ inline bool swap_out_minimal(CharacterState* c, WeaponId need) {
 
     if (try_after_clear()) return true;
 
-    // Find unique weapons in inventory
+    // collect unique weapons currently in inventory
     bool seen[W_ECLIPSE_RELIC + 1] = {false};
     WeaponId unique[INVENTORY_SLOTS];
     int unique_count = 0;
@@ -205,7 +168,7 @@ inline bool swap_out_minimal(CharacterState* c, WeaponId need) {
         }
     }
 
-    // Evict weapons one at a time until allocation succeeds
+    // evict weapons one by one until there's enough space
     for (int i = 0; i < unique_count; ++i) {
         WeaponId id = unique[i];
         clear_weapon_from_inventory(c, id);

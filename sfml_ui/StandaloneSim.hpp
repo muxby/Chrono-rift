@@ -1,40 +1,36 @@
 #pragma once
 
 #include "../shared.hpp"
-#include <random>
-#include <thread>
-#include <atomic>
+#include <pthread.h>
+#include <cstdlib>
+#include <ctime>
 
 namespace ChronoRift {
-
-// ═══════════════════════════════════════════════════════════════════════════
-// STANDALONE SIMULATION — Generates mock data for UI testing without
-// requiring the original arbiter/hip/asp processes.
-// ═══════════════════════════════════════════════════════════════════════════
 
 class StandaloneSimulation {
 public:
     StandaloneSimulation();
     ~StandaloneSimulation();
 
-    // Initialize mock shared state
     void init(SharedState* state);
-
-    // Start the simulation thread
     void start();
-
-    // Stop the simulation
     void stop();
 
-    // Check if running
-    bool isRunning() const { return running.load(); }
+    bool isRunning() {
+        pthread_mutex_lock(&running_mtx);
+        bool r = running;
+        pthread_mutex_unlock(&running_mtx);
+        return r;
+    }
 
 private:
     SharedState* state;
-    std::atomic<bool> running;
-    std::thread simThread;
-    std::mt19937 rng;
+    bool running;
+    pthread_mutex_t running_mtx;
+    pthread_t simThread;
+    bool threadStarted;
 
+    static void* threadEntry(void* arg);
     void simulationLoop();
     void simulateTurn();
     void simulateNPCAction(int npcId);

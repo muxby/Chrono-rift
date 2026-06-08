@@ -43,27 +43,74 @@ make all
 | CPU Scheduling | `sfml_arbiter.cpp:schedule_next_turn()` — stamina-based priority scheduling |
 | Real-time Visualization | `Visualizer.cpp` — SFML UI with 3 view modes |
 
+## UI Overview
+
+The game features a full SFML-based graphical interface with three view modes switchable via keyboard (1/2/3 keys):
+
+| Mode | Key | Description |
+|------|-----|-------------|
+| **Combat View** | `1` | UFC-style cage view with animated fighter sprites, HP bars, stamina bars, and team/opponent rosters. Player attacks are submitted via keyboard (Q/W/E/R for weapon selection). |
+| **Scheduler View** | `2` | Process control panel showing process blocks (states: running/ready/blocked/dead), Gantt chart, CPU metrics (throughput, waiting time, turnaround time), and scheduling controls (STAMINA/RR/FIFO/PRIORITY). |
+| **Hybrid View** | `3` | Split-screen combining combat visuals and scheduler metrics side-by-side. |
+
+### UI Features
+- **Intro Animation** — Fullscreen video-like intro sequence played on launch
+- **Background Video** — Animated background rendered from a 121-frame image sequence at 30 FPS
+- **Fighter Sprites** — Animated sprite sheets for 4 players and 4 enemies with attack animations
+- **Banners** — Team banner images displayed in roster panels
+- **Character Cards** — Live stats cards for each player and NPC showing HP, stamina, artifacts held
+- **Particle System** — Visual effects for attacks and events
+- **Connection Lines** — Visual mapping between processes and their states
+- **Deadlock Controls** — Toggle detection strategies: DETECT / NO_HOLD_WAIT / PREEMPT
+- **Theme** — Clean white/muted professional theme (defined in `UITheme.hpp`)
+
 ## File Structure
 
 ```
 chrono_rift/
-├── shared.hpp              — Shared data structures & types
-├── common.hpp              — Utility functions (shm_open, weapon ops)
+│
+├── shared.hpp              — Shared data structures, enums & types
+├── common.hpp              — Utility functions (shm_open, weapon ops, helpers)
+│
 ├── hip/
-│   └── hip.cpp             — Human Interfacing Process
+│   └── hip.cpp             — Human Interfacing Process (player input)
+│
 ├── asp/
-│   └── asp.cpp             — Automated Strategic Process (AI)
-├── sfml_ui/
-│   ├── sfml_arbiter.cpp    — SFML arbiter (game logic + Visualizer UI)
-│   ├── main.cpp            — Passive SFML visualizer
-│   ├── standalone_main.cpp — Multi-process launcher
-│   ├── Visualizer.hpp/cpp  — SFML Visualizer (3 view modes)
-│   ├── UIComponents.hpp/cpp — UI elements
-│   └── UITheme.hpp         — Neon dark theme
-├── Makefile                — Build system
-├── CMakeLists.txt          — CMake configuration
-├── EXECUTION_GUIDE.md      — Full documentation
-└── README.md               — This file
+│   └── asp.cpp             — Automated Strategic Process (AI opponent)
+│
+├── sfml_ui/                          — SFML graphical interface
+│   ├── sfml_arbiter.cpp             — Main arbiter: game logic, threading, UI
+│   ├── Visualizer.hpp / .cpp        — Core visualizer (3 view modes, rendering)
+│   ├── UIComponents.hpp / .cpp      — Reusable UI elements (cards, buttons, sliders)
+│   ├── UITheme.hpp                  — Color scheme & layout constants
+│   ├── SpriteAnimation.hpp / .cpp   — Animated sprite sheet player
+│   ├── ThreadPool.hpp / .cpp        — Thread pool for async tasks
+│   ├── LogPanel.hpp / .cpp          — Scrollable log output panel
+│   ├── StandaloneSim.hpp / .cpp     — Standalone simulation manager
+│   ├── main.cpp                     — Passive visualizer entry point
+│   ├── standalone_main.cpp          — Multi-process launcher (fork/exec)
+│   └── os_helpers.hpp               — OS-level helper functions
+│
+├── SPRITESHEET/                     — Game sprite assets
+│   ├── Players/
+│   │   ├── player_standing_sprites/ — Idle stance sprites (4 fighters)
+│   │   └── player_attack/           — Attack animation sprite sheets
+│   ├── enemy/
+│   │   ├── enemy standing/          — Enemy idle stance sprites
+│   │   └── enemy_attack/            — Enemy attack animation sheets
+│   └── banners/                     — Team banner portraits
+│
+├── background/                      — Animated background frames (121 JPGs)
+├── intro_frames/                    — Intro animation frames (121 JPGs)
+│
+├── scratch/
+│   └── check_seed.cpp              — Seed testing utility
+│
+├── Dockerfile                       — Containerized build & run
+├── Makefile                         — Build system
+├── requirements.txt                 — System dependency list
+├── EXECUTION_GUIDE.md               — Full documentation
+└── README.md                        — This file
 ```
 
 ## Key Implementation Details
